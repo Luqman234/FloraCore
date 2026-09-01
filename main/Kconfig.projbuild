@@ -1,0 +1,53 @@
+menu "FloraCore OTA"
+
+config FLORACORE_OTA_DEV_TEST
+    bool "Enable developer-only BLE OTA test command"
+    default n
+    help
+        Enables the developer command "ota test" through the existing
+        FloraCore BLE terminal custom-command hook.
+
+        This is for OTA bring-up only. Keep it disabled in production.
+        The OTA manager itself still restricts downloads to the FloraOS
+        firmware origin and validates TLS, project identity and version.
+
+config FLORACORE_OTA_TEST_URL
+    string "Developer OTA test image URL"
+    depends on FLORACORE_OTA_DEV_TEST
+    default "https://floraos.life/firmware/floracore/dev/FloraCore.bin"
+    help
+        HTTPS URL for the developer OTA test image. The OTA manager only
+        accepts URLs beginning with:
+        https://floraos.life/firmware/floracore/
+
+config FLORACORE_OTA_TEST_EXPECTED_VERSION
+    string "Expected developer OTA firmware version"
+    depends on FLORACORE_OTA_DEV_TEST
+    default "1.0.1"
+    help
+        Exact stable X.Y.Z version expected in the downloaded ESP-IDF
+        application descriptor. The candidate must also be newer than the
+        currently-running FloraCore firmware.
+
+endmenu
+
+menu "FloraCore Phase 20 hardware"
+
+config FLORACORE_GROW_LIGHT_ENABLE
+    bool "Enable grow-light actuator + command support"
+    default n
+    help
+        Keep this disabled until a real grow-light MOSFET/driver is wired and
+        verified. When disabled, FloraCore truthfully reports grow_light=false
+        and grow_light command support=0.
+
+config FLORACORE_GROW_LIGHT_GPIO
+    int "Grow-light MOSFET control GPIO"
+    depends on FLORACORE_GROW_LIGHT_ENABLE
+    range 1 48
+    default 41
+    help
+        ESP32-S3 GPIO connected to the 3.3 V-compatible grow-light driver.
+        Verify the physical board wiring before enabling this feature.
+
+endmenu
