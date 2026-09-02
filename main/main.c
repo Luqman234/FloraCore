@@ -948,4 +948,153 @@ void app_main(void)
 
                 /*
                  * A validated cloud watering command temporarily owns the
-                 * water actua
+                 * water actuator. The local soil loop must not race it.
+                 */
+                if (!floraos_phase20_water_command_active()) {
+                    if (soil_percent < SOIL_DRY_PERCENT) {
+                        water_pump_on();
+                    } else {
+                        water_pump_off();
+                    }
+                }
+
+                pump_for_cloud = phase20_water_get();
+
+                ESP_LOGI(
+                    TAG,
+                    "Soil ADC: %d | Moisture: %d%% | Status: %s | PUMP: %s",
+                    average_soil,
+                    soil_percent,
+                    soil_get_status(soil_percent),
+                    pump_for_cloud ? "ON" : "OFF"
+                );
+            }
+        } else {
+            floraos_phase20_set_water_lockout(true);
+            if (!floraos_phase20_water_command_active()) {
+                water_pump_off();
+            }
+        }
+
+        pump_for_cloud = phase20_water_get();
+
+        bool cloud_ready = floraos_cloud_housekeeping(
+            boot_mode,
+            &cloud_hello_announced
+        );
+
+        /*
+         * Device liveness is intentionally heartbeat-based. Telemetry, hello,
+         * claim, and other authenticated messages do not substitute for this
+         * heartbeat when the dashboard determines ONLINE/OFFLINE state.
+         */
+        if (cloud_ready && !setup_blocks_normal_cloud_traffic()) {
+            int64_t now_us = esp_timer_get_time();
+            int64_t heartbeat_interval_us =
+                (int64_t)FLORAOS_HEARTBEAT_INTERVAL_SECONDS * 1000000LL;
+
+            if (
+                last_heartbeat_us == 0 ||
+                now_us - last_heartbeat_us >= heartbeat_interval_us
+            ) {
+                char *heartbeat_payload =
+                    floraos_phase20_build_heartbeat(
+                        "NORMAL",
+                        phase20_ready
+                    );
+
+                if (heartbeat_payload != NULL) {
+                    esp_err_t heartbeat_err =
+                        floraos_phase20_queue_message(
+                            "heartbeat",
+                            heartbeat_payload,
+                            phase20_ready
+                        );
+
+                    floraos_phase20_free_payload(heartbeat_payload);
+
+                    if (heartbeat_err == ESP_OK) {
+                        last_heartbeat_us = now_us;
+                    } else {
+                        ESP_LOGW(
+                            TAG,
+                            "Could not queue heartbeat: %s",
+                            esp_err_to_name(heartbeat_err)
+                        );
+                    }
+                } else {
+                    ESP_LOGW(TAG, "Could not build Phase 20 heartbeat payload");
+                }
+            }
+        }
+
+        if (cloud_ready && !rtc_ntp_synced) {
+            if (sync_rtc_from_ntp() == ESP_OK) {
+                rtc_ntp_synced = true;
+            }
+        }
+
+        cloud_cycle++;
+
+        if (
+            cloud_ready &&
+            !setup_blocks_normal_cloud_traffic() &&
+            cloud_cycle >= 30
+        ) {
+            cloud_cycle = 0;
+
+            floraos_phase20_telemetry_t telemetry = {
+                .soil_adc_valid = soil_adc_valid,
+                .soil_adc = average_soil,
+                .soil_percent_valid = soil_percent_valid,
+                .soil_percent = soil_percent_for_cloud,
+                .light_valid = light_valid,
+                .light_lux = average_lux,
+                .pump_on = pump_for_cloud,
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+                .grow_light_valid = true,
+                .grow_light_on = phase20_grow_light_get(),
+#else
+                .grow_light_valid = false,
+                .grow_light_on = false,
+#endif
+                .rtc_valid = rtc_valid,
+                .rtc_text = {0}
+            };
+
+            if (rtc_valid) {
+                snprintf(
+                    telemetry.rtc_text,
+                    sizeof(telemetry.rtc_text),
+                    "%02u:%02u:%02u %02u/%02u/20%02u",
+                    rtc.hours,
+                    rtc.minutes,
+                    rtc.seconds,
+                    rtc.date,
+                    rtc.month,
+                    rtc.year
+                );
+            }
+
+            char *telemetry_payload =
+                floraos_phase20_build_telemetry(
+                    "NORMAL",
+                    &telemetry,
+                    phase20_ready
+                );
+
+            if (telemetry_payload != NULL) {
+                (void)floraos_phase20_queue_message(
+                    "telemetry",
+                    telemetry_payload,
+                    phase20_ready
+                );
+                floraos_phase20_free_payload(telemetry_payload);
+            } else {
+                ESP_LOGW(TAG, "Could not build telemetry payload");
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
