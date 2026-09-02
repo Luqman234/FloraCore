@@ -307,4 +307,215 @@ static esp_err_t networks_handler(httpd_req_t *req)
     );
 
     cJSON *root = cJSON_CreateObject();
-    cJ
+    cJSON *array = cJSON_AddArrayToObject(root, "networks");
+
+    if (err == ESP_OK) {
+        for (size_t i = 0; i < count; i++) {
+            cJSON *item = cJSON_CreateObject();
+            cJSON_AddStringToObject(item, "ssid", results[i].ssid);
+            cJSON_AddNumberToObject(item, "rssi", results[i].rssi);
+            cJSON_AddBoolToObject(item, "secure", results[i].secure);
+            cJSON_AddItemToArray(array, item);
+        }
+    }
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (json == NULL) {
+        return httpd_resp_send_err(
+            req,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "json allocation failed"
+        );
+    }
+
+    esp_err_t send_err = send_json(req, json);
+    cJSON_free(json);
+    return send_err;
+}
+
+static bool url_decode(
+    const char *src,
+    char *dst,
+    size_t dst_capacity
+)
+{
+    if (src == NULL || dst == NULL || dst_capacity == 0) return false;
+
+    size_t out = 0;
+    for (size_t i = 0; src[i] != '\0'; i++) {
+        if (out + 1 >= dst_capacity) return false;
+
+        if (src[i] == '+') {
+            dst[out++] = ' ';
+        } else if (src[i] == '%' &&
+                   src[i + 1] != '\0' &&
+                   src[i + 2] != '\0') {
+            char hex[3] = {src[i + 1], src[i + 2], '\0'};
+            char *end = NULL;
+            long value = strtol(hex, &end, 16);
+            if (end == NULL || *end != '\0') return false;
+            dst[out++] = (char)value;
+            i += 2;
+        } else {
+            dst[out++] = src[i];
+        }
+    }
+
+    dst[out] = '\0';
+    return true;
+}
+
+static bool form_value(
+    const char *body,
+    const char *name,
+    char *output,
+    size_t output_capacity
+)
+{
+    if (body == NULL || name == NULL || output == NULL) return false;
+
+    size_t name_len = strlen(name);
+    const char *cursor = body;
+
+    while (*cursor != '\0') {
+        const char *pair_end = strchr(cursor, '&');
+        if (pair_end == NULL) pair_end = cursor + strlen(cursor);
+
+        const char *eq = memchr(cursor, '=', (size_t)(pair_end - cursor));
+        if (eq != NULL &&
+            (size_t)(eq - cursor) == name_len &&
+            memcmp(cursor, name, name_len) == 0) {
+            size_t encoded_len = (size_t)(pair_end - eq - 1);
+            char encoded[FLORAOS_CLAIM_TOKEN_MAX_LEN * 3 + 1];
+
+            if (encoded_len >= sizeof(encoded)) return false;
+            memcpy(encoded, eq + 1, encoded_len);
+            encoded[encoded_len] = '\0';
+
+            bool ok = url_decode(encoded, output, output_capacity);
+            secure_zero(encoded, sizeof(encoded));
+            return ok;
+        }
+
+        cursor = *pair_end == '&' ? pair_end + 1 : pair_end;
+    }
+
+    return false;
+}
+
+static esp_err_t connect_handler(httpd_req_t *req)
+{
+    if (req->content_len <= 0 || req->content_len > SETUP_HTTP_BODY_MAX) {
+        return httpd_resp_send_err(
+            req,
+            HTTPD_400_BAD_REQUEST,
+            "invalid request"
+        );
+    }
+
+    char body[SETUP_HTTP_BODY_MAX + 1] = {0};
+    int received = 0;
+
+    while (received < req->content_len) {
+        int rc = httpd_req_recv(
+            req,
+            body + received,
+            req->content_len - received
+        );
+        if (rc <= 0) {
+            secure_zero(body, sizeof(body));
+            return ESP_FAIL;
+        }
+        received += rc;
+    }
+
+    setup_submission_t *submission = calloc(1, sizeof(*submission));
+    if (submission == NULL) {
+        secure_zero(body, sizeof(body));
+        return httpd_resp_send_err(
+            req,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "not enough memory"
+        );
+    }
+
+    bool ok =
+        form_value(body, "ssid", submission->ssid, sizeof(submission->ssid)) &&
+        form_value(body, "password", submission->password, sizeof(submission->password)) &&
+        form_value(body, "token", submission->token, sizeof(submission->token));
+
+    secure_zero(body, sizeof(body));
+
+    size_t ssid_len = strlen(submission->ssid);
+    size_t password_len = strlen(submission->password);
+
+    if (!ok ||
+        ssid_len == 0 ||
+        ssid_len >= WIFI_SSID_MAX_LEN ||
+        password_len >= WIFI_PASSWORD_MAX_LEN ||
+        !floraos_claim_token_is_valid(submission->token)) {
+        secure_zero(submission, sizeof(*submission));
+        free(submission);
+        return send_json(
+            req,
+            "{\"ok\":false,\"message\":\"Check the Wi-Fi details and Connection Code.\"}"
+        );
+    }
+
+    if (xQueueSend(
+            s_submission_queue,
+            &submission,
+            pdMS_TO_TICKS(100)
+        ) != pdTRUE) {
+        secure_zero(submission, sizeof(*submission));
+        free(submission);
+        return send_json(
+            req,
+            "{\"ok\":false,\"message\":\"FloraCore is already processing setup.\"}"
+        );
+    }
+
+    state_set(SETUP_CONNECTING, NULL);
+    return send_json(req, "{\"ok\":true}");
+}
+
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    setup_portal_state_t state = setup_portal_state();
+    char reason[SETUP_REASON_MAX] = {0};
+    setup_portal_reason(reason, sizeof(reason));
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "state", setup_portal_state_name(state));
+    if (reason[0] != '\0') {
+        cJSON_AddStringToObject(root, "reason", reason);
+    }
+    cJSON_AddStringToObject(root, "message", friendly_message(state, reason));
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (json == NULL) {
+        return httpd_resp_send_err(
+            req,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "json allocation failed"
+        );
+    }
+
+    esp_err_t err = send_json(req, json);
+    cJSON_free(json);
+    return err;
+}
+
+static esp_err_t start_http_server(void)
+{
+    if (s_http_server != NULL) return ESP_OK;
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 12;
+    config.lru_purge_enable = true;
+
+    esp_err_t err = httpd_start(&s
