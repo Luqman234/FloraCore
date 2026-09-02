@@ -553,3 +553,70 @@ static void stop_http_server(void)
         s_http_server = NULL;
         (void)httpd_stop(server);
     }
+}
+
+static void dns_server_task(void *parameter)
+{
+    (void)parameter;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        s_dns_running = false;
+        s_dns_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    s_dns_socket = sock;
+
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(53),
+        .sin_addr.s_addr = htonl(INADDR_ANY)
+    };
+
+    if (bind(
+            sock,
+            (struct sockaddr *)&address,
+            sizeof(address)
+        ) < 0) {
+        close(sock);
+        s_dns_socket = -1;
+        s_dns_running = false;
+        s_dns_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    s_dns_running = true;
+    uint8_t request[512];
+    uint8_t response[512];
+
+    while (s_dns_running) {
+        struct sockaddr_in client;
+        socklen_t client_len = sizeof(client);
+
+        int len = recvfrom(
+            sock,
+            request,
+            sizeof(request),
+            0,
+            (struct sockaddr *)&client,
+            &client_len
+        );
+        if (len < 12) continue;
+
+        memcpy(response, request, (size_t)len);
+
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6] = 0x00;
+        response[7] = 0x01;
+        response[8] = response[9] = response[10] = response[11] = 0;
+
+        int pos = 12;
+        while (pos < len && request[pos] != 0) {
+            int label = request[pos];
+            pos += label + 1;
+        }
+   
