@@ -226,4 +226,230 @@ void wifi_manager_init(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
 
-    ret = esp_event_loop_create_def
+    ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(ret);
+    }
+
+    if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") == NULL) {
+        esp_netif_create_default_wifi_sta();
+    }
+    if (esp_netif_get_handle_from_ifkey("WIFI_AP_DEF") == NULL) {
+        esp_netif_create_default_wifi_ap();
+    }
+
+    wifi_init_config_t wifi_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_config));
+
+    wifi_event_group = xEventGroupCreate();
+    if (wifi_event_group == NULL) {
+        abort();
+    }
+
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            WIFI_EVENT,
+            ESP_EVENT_ANY_ID,
+            wifi_event_handler,
+            NULL
+        )
+    );
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            IP_EVENT,
+            IP_EVENT_STA_GOT_IP,
+            wifi_event_handler,
+            NULL
+        )
+    );
+
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    wifi_initialized = true;
+    ESP_LOGI(TAG, "Wi-Fi + NVS initialized");
+}
+
+bool wifi_manager_connect(void)
+{
+    if (!wifi_initialized || !wifi_credentials_load()) {
+        return false;
+    }
+
+    s_station_ready = false;
+
+    wifi_candidate_t candidates[MAX_WIFI_NETWORKS] = {0};
+    size_t count = scan_known_networks(candidates, MAX_WIFI_NETWORKS);
+
+    for (size_t i = 0; i < count; i++) {
+        size_t index = candidates[i].credential_index;
+        const char *ssid = known_networks[index].ssid;
+
+        if (!connect_to_candidate(&candidates[i])) {
+            continue;
+        }
+
+        /*
+         * Association + DHCP is the Wi-Fi manager's responsibility.
+         * Do not depend on Google, ICMP, or any third-party connectivity
+         * probe. FloraOS HTTPS requests determine service reachability.
+         */
+        ESP_LOGI(TAG, "Wi-Fi ready on %s; FloraOS will verify service reachability", ssid);
+        return true;
+    }
+
+    return false;
+}
+
+bool wifi_manager_station_ready(void)
+{
+    return s_station_ready;
+}
+
+bool wifi_manager_internet_available(void)
+{
+    return wifi_manager_station_ready();
+}
+
+uint8_t wifi_manager_last_disconnect_reason(void)
+{
+    return s_last_disconnect_reason;
+}
+
+esp_err_t wifi_manager_scan_visible(
+    wifi_manager_scan_result_t *results,
+    size_t capacity,
+    size_t *out_count
+)
+{
+    if (!wifi_initialized || results == NULL ||
+        out_count == NULL || capacity == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_count = 0;
+    memset(results, 0, capacity * sizeof(*results));
+
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false
+    };
+
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) return err;
+
+    uint16_t ap_count = 0;
+    err = esp_wifi_scan_get_ap_num(&ap_count);
+    if (err != ESP_OK || ap_count == 0) return err;
+
+    if (ap_count > 64) ap_count = 64;
+
+    wifi_ap_record_t *records = calloc(ap_count, sizeof(*records));
+    if (records == NULL) return ESP_ERR_NO_MEM;
+
+    uint16_t record_count = ap_count;
+    err = esp_wifi_scan_get_ap_records(&record_count, records);
+    if (err != ESP_OK) {
+        free(records);
+        return err;
+    }
+
+    size_t count = 0;
+
+    for (uint16_t i = 0; i < record_count; i++) {
+        const char *raw_ssid = (const char *)records[i].ssid;
+        size_t ssid_len = strnlen(raw_ssid, 32);
+
+        if (ssid_len == 0) continue;
+        if (ssid_len >= 10 && memcmp(raw_ssid, "FloraCore-", 10) == 0) {
+            continue;
+        }
+
+        char ssid[WIFI_SSID_MAX_LEN] = {0};
+        memcpy(ssid, raw_ssid, ssid_len);
+
+        size_t existing = count;
+        for (size_t j = 0; j < count; j++) {
+            if (strcmp(results[j].ssid, ssid) == 0) {
+                existing = j;
+                break;
+            }
+        }
+
+        if (existing < count) {
+            if (records[i].rssi > results[existing].rssi) {
+                results[existing].rssi = records[i].rssi;
+                results[existing].secure =
+                    records[i].authmode != WIFI_AUTH_OPEN;
+            }
+            continue;
+        }
+
+        if (count >= capacity) continue;
+
+        strlcpy(results[count].ssid, ssid, sizeof(results[count].ssid));
+        results[count].rssi = records[i].rssi;
+        results[count].secure = records[i].authmode != WIFI_AUTH_OPEN;
+        count++;
+    }
+
+    free(records);
+
+    for (size_t i = 0; i + 1 < count; i++) {
+        for (size_t j = i + 1; j < count; j++) {
+            if (results[j].rssi > results[i].rssi) {
+                wifi_manager_scan_result_t temp = results[i];
+                results[i] = results[j];
+                results[j] = temp;
+            }
+        }
+    }
+
+    *out_count = count;
+    return ESP_OK;
+}
+
+static wifi_manager_connect_result_t classify_disconnect(void)
+{
+    switch (s_last_disconnect_reason) {
+        case WIFI_REASON_AUTH_EXPIRE:
+        case WIFI_REASON_AUTH_FAIL:
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+            return WIFI_MANAGER_CONNECT_AUTH_FAILED;
+
+        case WIFI_REASON_NO_AP_FOUND:
+            return WIFI_MANAGER_CONNECT_NO_AP;
+
+        default:
+            return WIFI_MANAGER_CONNECT_FAILED;
+    }
+}
+
+wifi_manager_connect_result_t wifi_manager_connect_credentials(
+    const char *ssid,
+    const char *password
+)
+{
+    if (!wifi_initialized || !valid_ssid(ssid) || !valid_password(password)) {
+        return WIFI_MANAGER_CONNECT_FAILED;
+    }
+
+    s_station_ready = false;
+    s_last_disconnect_reason = 0;
+
+    wifi_mode_t desired_mode =
+        s_setup_ap_active ? WIFI_MODE_APSTA : WIFI_MODE_STA;
+
+    if (esp_wifi_set_mode(desired_mode) != ESP_OK) {
+        return WIFI_MANAGER_CONNECT_FAILED;
+    }
+
+    (void)esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    xEventGroupClearBits(
+        wifi_eve
