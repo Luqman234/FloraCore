@@ -736,4 +736,212 @@ static int64_t claim_retry_delay_us(unsigned attempts)
     unsigned seconds = 1U << shift;
 
     if (seconds > SETUP_CLAIM_RETRY_MAX_DELAY_SECONDS) {
-        seconds 
+        seconds = SETUP_CLAIM_RETRY_MAX_DELAY_SECONDS;
+    }
+
+    return (int64_t)seconds * 1000000LL;
+}
+
+static void claim_result_callback(
+    esp_err_t result,
+    const char *response_plaintext,
+    void *user_ctx
+)
+{
+    (void)user_ctx;
+
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+
+    s_claim_in_flight = false;
+
+    if (result != ESP_OK) {
+        /*
+         * A transport/TLS/Cloudflare failure does not invalidate the user's
+         * Connection Code. Keep the token only in RAM, remain in CLAIMING,
+         * and retry with capped exponential backoff. A definitive encrypted
+         * FloraOS response is what decides success or rejection.
+         */
+        state_set_locked(SETUP_CLAIMING, "backend_unreachable");
+        s_next_claim_attempt_us =
+            esp_timer_get_time() + claim_retry_delay_us(s_claim_attempts);
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    cJSON *root =
+        cJSON_Parse(response_plaintext != NULL ? response_plaintext : "");
+
+    if (root == NULL) {
+        state_set_locked(SETUP_FAILED, "server_verification_failed");
+        wipe_pending_token_locked();
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
+
+    if (cJSON_IsTrue(ok)) {
+        (void)setup_pending_store(false);
+        wipe_pending_token_locked();
+        state_set_locked(SETUP_SUCCESS, NULL);
+        s_success_at_us = esp_timer_get_time();
+        cJSON_Delete(root);
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    cJSON *error = cJSON_GetObjectItemCaseSensitive(root, "error");
+    const char *reason = cJSON_IsString(error)
+        ? claim_error_reason(error->valuestring)
+        : "server_verification_failed";
+
+    state_set_locked(SETUP_FAILED, reason);
+    wipe_pending_token_locked();
+    cJSON_Delete(root);
+    xSemaphoreGive(s_lock);
+}
+
+static void setup_worker_task(void *parameter)
+{
+    (void)parameter;
+
+    while (1) {
+        setup_submission_t *submission = NULL;
+
+        if (xQueueReceive(
+                s_submission_queue,
+                &submission,
+                portMAX_DELAY
+            ) != pdTRUE ||
+            submission == NULL) {
+            continue;
+        }
+
+        state_set(SETUP_CONNECTING, NULL);
+
+        wifi_manager_connect_result_t result =
+            wifi_manager_connect_credentials(
+                submission->ssid,
+                submission->password
+            );
+
+        if (result != WIFI_MANAGER_CONNECT_OK) {
+            state_set(
+                SETUP_FAILED,
+                wifi_manager_connect_result_name(result)
+            );
+            secure_zero(submission, sizeof(*submission));
+            free(submission);
+            continue;
+        }
+
+        state_set(SETUP_WIFI_CONNECTED, NULL);
+
+        esp_err_t save_err = wifi_credentials_save(
+            submission->ssid,
+            submission->password
+        );
+
+        if (save_err != ESP_OK) {
+            state_set(SETUP_FAILED, "storage_failed");
+            secure_zero(submission, sizeof(*submission));
+            free(submission);
+            continue;
+        }
+
+        if (setup_pending_store(true) != ESP_OK) {
+            state_set(SETUP_FAILED, "storage_failed");
+            secure_zero(submission, sizeof(*submission));
+            free(submission);
+            continue;
+        }
+
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            wipe_pending_token_locked();
+            strlcpy(
+                s_pending_token,
+                submission->token,
+                sizeof(s_pending_token)
+            );
+            s_claim_attempts = 0;
+            s_next_claim_attempt_us = esp_timer_get_time();
+            state_set_locked(SETUP_CLAIMING, NULL);
+            xSemaphoreGive(s_lock);
+        }
+
+        secure_zero(submission, sizeof(*submission));
+        free(submission);
+    }
+}
+
+static void stop_setup_services_after_success(void)
+{
+    stop_http_server();
+    stop_dns_server();
+    (void)wifi_manager_stop_setup_ap();
+    s_active = false;
+}
+
+static void setup_supervisor_task(void *parameter)
+{
+    (void)parameter;
+
+    while (1) {
+        bool queue_claim = false;
+        bool stop_after_success = false;
+        char token[FLORAOS_CLAIM_TOKEN_MAX_LEN + 1] = {0};
+
+        if (s_lock != NULL &&
+            xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+            int64_t now = esp_timer_get_time();
+
+            if (s_state == SETUP_CLAIMING &&
+                !s_claim_in_flight &&
+                s_pending_token[0] != '\0' &&
+                now >= s_next_claim_attempt_us) {
+                strlcpy(token, s_pending_token, sizeof(token));
+                s_claim_in_flight = true;
+                if (s_claim_attempts < 6) {
+                    s_claim_attempts++;
+                }
+                state_set_locked(SETUP_CLAIMING, NULL);
+                queue_claim = true;
+            }
+
+            if (s_state == SETUP_SUCCESS &&
+                s_success_at_us > 0 &&
+                now - s_success_at_us >=
+                    (int64_t)SETUP_SUCCESS_GRACE_MS * 1000LL) {
+                stop_after_success = true;
+            }
+
+            xSemaphoreGive(s_lock);
+        }
+
+        if (queue_claim) {
+            esp_err_t err = floraos_claim_start(
+                token,
+                claim_result_callback,
+                NULL
+            );
+
+            secure_zero(token, sizeof(token));
+
+            if (err != ESP_OK &&
+                xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+                s_claim_in_flight = false;
+                state_set_locked(SETUP_CLAIMING, "backend_unreachable");
+                s_next_claim_attempt_us =
+                    esp_timer_get_time() + claim_retry_delay_us(s_claim_attempts);
+                xSemaphoreGive(s_lock);
+            }
+        }
+
+        if (stop_after_success) {
+            stop_setup_services_after_success();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
