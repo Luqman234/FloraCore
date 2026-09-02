@@ -429,4 +429,211 @@ static void finish_failed(const char *command_id, const char *error)
     }
 
     (void)send_failed(command_id, error);
-    clear_active_command(comman
+    clear_active_command(command_id);
+}
+
+static void finish_completed(
+    const char *command_id,
+    uint64_t started_at_ms,
+    uint64_t finished_at_ms,
+    uint32_t actual_duration_ms,
+    uint32_t armed_duration_seconds
+)
+{
+    if (s_lock != NULL && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        (void)update_record_locked(
+            command_id,
+            RECORD_COMPLETED,
+            NULL,
+            actual_duration_ms
+        );
+        xSemaphoreGive(s_lock);
+    }
+
+    (void)send_completed(
+        command_id,
+        started_at_ms,
+        finished_at_ms,
+        actual_duration_ms,
+        armed_duration_seconds
+    );
+
+    clear_active_command(command_id);
+}
+
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+static void grow_light_auto_off(void *argument)
+{
+    (void)argument;
+
+    if (s_initialized && s_ops.grow_light_set != NULL) {
+        (void)s_ops.grow_light_set(false);
+    }
+}
+#endif
+
+static void command_task(void *argument)
+{
+    (void)argument;
+
+    while (1) {
+        command_action_t action;
+        memset(&action, 0, sizeof(action));
+
+        if (xQueueReceive(s_command_queue, &action, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        if (setup_blocked_now()) {
+            finish_failed(action.command_id, "setup_in_progress");
+            continue;
+        }
+
+        if (ota_in_progress_now()) {
+            finish_failed(action.command_id, "ota_in_progress");
+            continue;
+        }
+
+        if (action.type == ACTION_WATER) {
+            if (water_lockout_now()) {
+                finish_failed(action.command_id, "local_safety_lockout");
+                continue;
+            }
+
+            uint64_t started_at_ms = monotonic_ms();
+
+            if (s_ops.water_set == NULL || s_ops.water_set(true) != ESP_OK) {
+                if (s_ops.water_set != NULL) (void)s_ops.water_set(false);
+                finish_failed(action.command_id, "actuator_fault");
+                continue;
+            }
+
+            const uint64_t target_ms = action.duration;
+            bool aborted = false;
+            const char *abort_error = NULL;
+
+            while (monotonic_ms() - started_at_ms < target_ms) {
+                if (setup_blocked_now()) {
+                    aborted = true;
+                    abort_error = "setup_in_progress";
+                    break;
+                }
+
+                if (ota_in_progress_now()) {
+                    aborted = true;
+                    abort_error = "ota_in_progress";
+                    break;
+                }
+
+                if (water_lockout_now()) {
+                    aborted = true;
+                    abort_error = "local_safety_lockout";
+                    break;
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(25));
+            }
+
+            esp_err_t off_err = s_ops.water_set(false);
+            uint64_t finished_at_ms = monotonic_ms();
+
+            if (off_err != ESP_OK) {
+                finish_failed(action.command_id, "actuator_fault");
+                continue;
+            }
+
+            if (aborted) {
+                finish_failed(action.command_id, abort_error);
+                continue;
+            }
+
+            uint64_t measured = finished_at_ms - started_at_ms;
+            if (measured > UINT32_MAX) measured = UINT32_MAX;
+
+            finish_completed(
+                action.command_id,
+                started_at_ms,
+                finished_at_ms,
+                (uint32_t)measured,
+                0
+            );
+            continue;
+        }
+
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+        if (
+            action.type == ACTION_GROW_LIGHT_ON ||
+            action.type == ACTION_GROW_LIGHT_OFF
+        ) {
+            if (s_ops.grow_light_set == NULL) {
+                finish_failed(action.command_id, "actuator_fault");
+                continue;
+            }
+
+            uint64_t started_at_ms = monotonic_ms();
+
+            if (s_grow_light_timer != NULL) {
+                (void)esp_timer_stop(s_grow_light_timer);
+            }
+
+            bool turn_on = action.type == ACTION_GROW_LIGHT_ON;
+            if (s_ops.grow_light_set(turn_on) != ESP_OK) {
+                (void)s_ops.grow_light_set(false);
+                finish_failed(action.command_id, "actuator_fault");
+                continue;
+            }
+
+            if (turn_on) {
+                esp_err_t timer_err = esp_timer_start_once(
+                    s_grow_light_timer,
+                    (uint64_t)action.duration * 1000000ULL
+                );
+
+                if (timer_err != ESP_OK) {
+                    (void)s_ops.grow_light_set(false);
+                    finish_failed(action.command_id, "actuator_fault");
+                    continue;
+                }
+            }
+
+            uint64_t finished_at_ms = monotonic_ms();
+            uint64_t measured = finished_at_ms - started_at_ms;
+            if (measured > UINT32_MAX) measured = UINT32_MAX;
+
+            /*
+             * For grow_light=on, completion means the output changed and the
+             * local auto-off timer was successfully armed. It does not wait
+             * for the requested hours to elapse.
+             */
+            finish_completed(
+                action.command_id,
+                started_at_ms,
+                finished_at_ms,
+                (uint32_t)measured,
+                turn_on ? action.duration : 0
+            );
+            continue;
+        }
+#endif
+
+        finish_failed(action.command_id, "invalid_parameters");
+    }
+}
+
+static bool valid_command_id(const char *command_id)
+{
+    if (command_id == NULL) return false;
+
+    size_t len = strlen(command_id);
+    if (len < 5 || len > PHASE20_COMMAND_ID_MAX) return false;
+    return strncmp(command_id, "cmd_", 4) == 0;
+}
+
+static bool json_u32(cJSON *object, const char *key, uint32_t *value)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsNumber(item) || item->valuedouble < 0 || item->valuedouble > UINT32_MAX) {
+        return false;
+    }
+
+    double raw = item
