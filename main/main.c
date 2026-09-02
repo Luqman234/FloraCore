@@ -502,4 +502,229 @@ static bool floraos_cloud_housekeeping(
     if (ota_manager_update_in_progress()) {
         floraos_phase20_force_safe_outputs();
         if (hello_announced != NULL) {
-            *hello_announced 
+            *hello_announced = false;
+        }
+        return false;
+    }
+
+    /*
+     * First-time onboarding owns the FloraOS cloud channel until ownership
+     * is confirmed. During SETUP_IDLE / CONNECTING / WIFI_CONNECTED /
+     * CLAIMING / FAILED, setup_portal.c may send only the encrypted claim.
+     *
+     * This prevents hello/heartbeat/telemetry from competing with the
+     * ownership handshake on a factory-new FloraCore.
+     */
+    if (setup_blocks_normal_cloud_traffic()) {
+        floraos_phase20_force_safe_outputs();
+        if (hello_announced != NULL) {
+            *hello_announced = false;
+        }
+        return false;
+    }
+
+    if (!wifi_manager_station_ready()) {
+        if (hello_announced != NULL) {
+            *hello_announced = false;
+        }
+        return false;
+    }
+
+    if (!floraos_client_is_ready()) {
+        esp_err_t init_err = floraos_client_init();
+        if (init_err != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "FloraOS secure client init deferred: %s",
+                esp_err_to_name(init_err)
+            );
+            return false;
+        }
+    }
+
+    if (hello_announced != NULL && !*hello_announced) {
+        char payload[160] = {0};
+
+        snprintf(
+            payload,
+            sizeof(payload),
+            "{\"mode\":\"%s\",\"event\":\"online\"}",
+            system_mode_name(boot_mode)
+        );
+
+        esp_err_t send_err =
+            floraos_client_queue_message("hello", payload);
+
+        if (send_err == ESP_OK) {
+            *hello_announced = true;
+        }
+    }
+
+    return floraos_client_is_ready();
+}
+
+
+/*
+ * Confirm a newly-installed OTA image only after FloraCore's common software
+ * stack is demonstrably alive.
+ *
+ * What counts as health here:
+ *   - OTA metadata can be read
+ *   - encrypted NVS / Wi-Fi stack initialized (already reached this point)
+ *   - system mode loaded
+ *   - BLE terminal initialized
+ *   - HMAC_UP-derived FloraOS crypto + HTTPS worker initialized
+ *   - if Wi-Fi recovery is required, the setup portal started successfully
+ *
+ * Deliberately NOT required:
+ *   - internet / Cloudflare / floraos.life availability
+ *   - BH1750, DS3231 or soil sensor presence
+ *
+ * Network outages and disconnected plant sensors are environmental conditions,
+ * not evidence that the firmware image itself is broken.
+ */
+static void ota_validate_candidate(
+    bool setup_required,
+    esp_err_t setup_start_result
+)
+{
+    if (!ota_manager_is_pending_verify()) {
+        return;
+    }
+
+    ESP_LOGW(
+        TAG,
+        "Validating newly-installed OTA candidate..."
+    );
+
+    /*
+     * floraos_client_init() performs the local hardware-derived identity /
+     * AES-GCM initialization and starts the existing dedicated HTTPS worker.
+     * It does not need an active Wi-Fi connection to initialize.
+     */
+    esp_err_t crypto_err =
+        floraos_client_init();
+
+    if (crypto_err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "OTA candidate failed FloraOS crypto/client self-test: %s",
+            esp_err_to_name(crypto_err)
+        );
+
+        ESP_ERROR_CHECK(
+            ota_manager_rollback_and_reboot(
+                "HMAC_UP / FloraOS crypto-client initialization failed"
+            )
+        );
+
+        return;
+    }
+
+    if (
+        setup_required &&
+        setup_start_result != ESP_OK
+    ) {
+        ESP_LOGE(
+            TAG,
+            "OTA candidate cannot provide required recovery setup: %s",
+            esp_err_to_name(setup_start_result)
+        );
+
+        ESP_ERROR_CHECK(
+            ota_manager_rollback_and_reboot(
+                "required beginner setup portal could not start"
+            )
+        );
+
+        return;
+    }
+
+    /*
+     * Give common background tasks a brief chance to expose an immediate
+     * startup fault.  This delay happens only once on the first boot of a
+     * newly-installed OTA image.
+     */
+    vTaskDelay(
+        pdMS_TO_TICKS(
+            OTA_CANDIDATE_SETTLE_MS
+        )
+    );
+
+    esp_err_t valid_err =
+        ota_manager_mark_valid();
+
+    if (valid_err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not commit OTA candidate as valid: %s",
+            esp_err_to_name(valid_err)
+        );
+
+        /*
+         * Do not continue indefinitely with an unconfirmed candidate.
+         */
+        ESP_ERROR_CHECK(
+            ota_manager_rollback_and_reboot(
+                "could not commit OTA validity"
+            )
+        );
+    }
+}
+
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting FloraCore...");
+
+    /*
+     * Read OTA state before bringing up the rest of FloraCore.  This does not
+     * accept a candidate; it merely records whether this is its one
+     * PENDING_VERIFY boot.
+     */
+    ESP_ERROR_CHECK(
+        ota_manager_init()
+    );
+
+    wifi_manager_init();
+
+    floracore_mode_t boot_mode = system_mode_load();
+
+    bool phase20_ready = false;
+
+    if (boot_mode == FLORACORE_MODE_NORMAL) {
+        water_pump_init();
+
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+        grow_light_init();
+#endif
+
+        floraos_phase20_ops_t phase20_ops = {
+            .setup_blocked = setup_blocks_normal_cloud_traffic,
+            .ota_in_progress = ota_manager_update_in_progress,
+            .water_set = phase20_water_set,
+            .water_get = phase20_water_get,
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+            .grow_light_set = phase20_grow_light_set,
+            .grow_light_get = phase20_grow_light_get
+#else
+            .grow_light_set = NULL,
+            .grow_light_get = NULL
+#endif
+        };
+
+        esp_err_t phase20_err = floraos_phase20_init(&phase20_ops);
+        if (phase20_err == ESP_OK) {
+            phase20_ready = true;
+        } else {
+            ESP_LOGE(
+                TAG,
+                "Phase 20 command/runtime init failed; command_protocol will stay disabled: %s",
+                esp_err_to_name(phase20_err)
+            );
+        }
+    }
+
+    ESP_ERROR_CHECK(ble_terminal_init());
+
+    ble_terminal_set_command_handl
