@@ -220,4 +220,213 @@ static esp_err_t create_inflight_record_locked(const char *command_id, uint8_t *
         return err;
     }
 
-    uint8_t slot = (uint8_t)(head % PHASE20_DEDU
+    uint8_t slot = (uint8_t)(head % PHASE20_DEDUPE_SLOTS);
+    err = write_record_locked(slot, command_id, RECORD_INFLIGHT, NULL, 0);
+    if (err != ESP_OK) return err;
+
+    head = (uint8_t)((slot + 1U) % PHASE20_DEDUPE_SLOTS);
+    err = nvs_set_u8(s_nvs, "head", head);
+    if (err != ESP_OK) return err;
+    err = nvs_commit(s_nvs);
+    if (err != ESP_OK) return err;
+
+    if (slot_out != NULL) *slot_out = slot;
+    return ESP_OK;
+}
+
+static esp_err_t update_record_locked(
+    const char *command_id,
+    record_status_t status,
+    const char *error,
+    uint32_t actual_duration_ms
+)
+{
+    dedupe_record_t existing;
+    if (!find_record_locked(command_id, &existing)) {
+        uint8_t slot = 0;
+        esp_err_t err = create_inflight_record_locked(command_id, &slot);
+        if (err != ESP_OK) return err;
+        return write_record_locked(slot, command_id, status, error, actual_duration_ms);
+    }
+
+    return write_record_locked(
+        existing.slot,
+        command_id,
+        status,
+        error,
+        actual_duration_ms
+    );
+}
+
+static void recover_inflight_records_locked(void)
+{
+    for (uint8_t slot = 0; slot < PHASE20_DEDUPE_SLOTS; slot++) {
+        char command_id[PHASE20_COMMAND_ID_MAX + 1] = {0};
+        if (!read_slot_id_locked(slot, command_id, sizeof(command_id))) {
+            continue;
+        }
+
+        char key[16];
+        uint8_t status = RECORD_NONE;
+        make_slot_key(key, sizeof(key), "st", slot);
+
+        if (nvs_get_u8(s_nvs, key, &status) != ESP_OK) {
+            continue;
+        }
+
+        if (status == RECORD_INFLIGHT) {
+            /*
+             * A reboot may have happened after physical actuation started but
+             * before a terminal result was persisted. Fail closed: never replay
+             * that command ID after reboot.
+             */
+            (void)write_record_locked(
+                slot,
+                command_id,
+                RECORD_FAILED,
+                "local_safety_lockout",
+                0
+            );
+        }
+    }
+}
+
+static esp_err_t queue_command_result_json(cJSON *payload)
+{
+    if (payload == NULL) return ESP_ERR_INVALID_ARG;
+
+    char *text = cJSON_PrintUnformatted(payload);
+    if (text == NULL) return ESP_ERR_NO_MEM;
+
+    /*
+     * Do not attach the command-response callback to command_result itself.
+     * The next heartbeat/telemetry is the next command-delivery opportunity;
+     * this avoids an accidental response/result feedback loop.
+     */
+    esp_err_t err = floraos_client_queue_message("command_result", text);
+    free(text);
+    return err;
+}
+
+static esp_err_t send_acknowledged(const char *command_id, uint64_t accepted_at_ms)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *result = cJSON_CreateObject();
+    if (root == NULL || result == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(result);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "command_id", command_id);
+    cJSON_AddStringToObject(root, "status", "acknowledged");
+    cJSON_AddNumberToObject(result, "accepted_at_ms", (double)accepted_at_ms);
+    cJSON_AddItemToObject(root, "result", result);
+
+    esp_err_t err = queue_command_result_json(root);
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t send_completed(
+    const char *command_id,
+    uint64_t started_at_ms,
+    uint64_t finished_at_ms,
+    uint32_t actual_duration_ms,
+    uint32_t armed_duration_seconds
+)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *result = cJSON_CreateObject();
+    if (root == NULL || result == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(result);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "command_id", command_id);
+    cJSON_AddStringToObject(root, "status", "completed");
+    cJSON_AddNumberToObject(result, "started_at_ms", (double)started_at_ms);
+    cJSON_AddNumberToObject(result, "finished_at_ms", (double)finished_at_ms);
+    cJSON_AddNumberToObject(result, "actual_duration_ms", (double)actual_duration_ms);
+
+    if (armed_duration_seconds > 0) {
+        cJSON_AddNumberToObject(
+            result,
+            "armed_duration_seconds",
+            (double)armed_duration_seconds
+        );
+    }
+
+    cJSON_AddItemToObject(root, "result", result);
+
+    esp_err_t err = queue_command_result_json(root);
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t send_failed(const char *command_id, const char *error)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) return ESP_ERR_NO_MEM;
+
+    cJSON_AddStringToObject(root, "command_id", command_id);
+    cJSON_AddStringToObject(root, "status", "failed");
+    cJSON_AddStringToObject(
+        root,
+        "error",
+        (error != NULL && error[0] != '\0') ? error : "local_safety_lockout"
+    );
+
+    esp_err_t err = queue_command_result_json(root);
+    cJSON_Delete(root);
+    return err;
+}
+
+static bool setup_blocked_now(void)
+{
+    return s_ops.setup_blocked != NULL && s_ops.setup_blocked();
+}
+
+static bool ota_in_progress_now(void)
+{
+    return s_ops.ota_in_progress != NULL && s_ops.ota_in_progress();
+}
+
+static bool water_lockout_now(void)
+{
+    bool locked = true;
+
+    if (s_lock != NULL && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        locked = s_water_lockout;
+        xSemaphoreGive(s_lock);
+    }
+
+    return locked;
+}
+
+static void clear_active_command(const char *command_id)
+{
+    if (s_lock == NULL) return;
+
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        if (
+            command_id != NULL &&
+            strcmp(s_active_command_id, command_id) == 0
+        ) {
+            s_active_command_id[0] = '\0';
+            s_active_action = 0;
+        }
+        xSemaphoreGive(s_lock);
+    }
+}
+
+static void finish_failed(const char *command_id, const char *error)
+{
+    if (s_lock != NULL && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        (void)update_record_locked(command_id, RECORD_FAILED, error, 0);
+        xSemaphoreGive(s_lock);
+    }
+
+    (void)send_failed(command_id, error);
+    clear_active_command(comman
