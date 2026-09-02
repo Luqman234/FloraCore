@@ -727,4 +727,225 @@ void app_main(void)
 
     ESP_ERROR_CHECK(ble_terminal_init());
 
-    ble_terminal_set_command_handl
+    ble_terminal_set_command_handler(floracore_ble_command);
+
+#if TEMP_WIFI_PROVISIONING
+    ESP_ERROR_CHECK(
+        wifi_credentials_save(
+            "YOUR_WIFI_SSID",
+            "YOUR_WIFI_PASSWORD"
+        )
+    );
+#endif
+
+    bool boot_network_ready = wifi_manager_connect();
+
+    if (boot_network_ready) {
+        ESP_LOGI(
+            TAG,
+            "FloraCore Wi-Fi is ready; FloraOS will verify service reachability"
+        );
+    } else {
+        ESP_LOGW(
+            TAG,
+            "No usable saved Wi-Fi."
+        );
+    }
+
+    bool resume_setup = setup_portal_should_resume();
+    bool setup_required =
+        !boot_network_ready ||
+        resume_setup;
+
+    esp_err_t setup_start_result =
+        ESP_OK;
+
+    if (setup_required) {
+        ESP_LOGW(
+            TAG,
+            "%s. Starting beginner setup mode.",
+            resume_setup
+                ? "Previous customer setup has not completed ownership"
+                : "FloraCore needs Wi-Fi configuration"
+        );
+
+        setup_start_result =
+            setup_portal_start();
+
+        if (setup_start_result != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Could not start consumer setup portal: %s",
+                esp_err_to_name(setup_start_result)
+            );
+        }
+    }
+
+    /*
+     * If this is the first boot of a downloaded candidate, it is still
+     * PENDING_VERIFY here.  Validate the common FloraCore runtime before
+     * allowing ESP-IDF to regard it as a permanent boot image.
+     */
+    ota_validate_candidate(
+        setup_required,
+        setup_start_result
+    );
+
+    bool cloud_hello_announced = false;
+    (void)floraos_cloud_housekeeping(
+        boot_mode,
+        &cloud_hello_announced
+    );
+
+    if (boot_mode == FLORACORE_MODE_COM_DEV) {
+        ESP_LOGW(TAG, "COM DEV MODE ACTIVE");
+
+        while (1) {
+            bool cloud_ready = floraos_cloud_housekeeping(
+                boot_mode,
+                &cloud_hello_announced
+            );
+
+            if (cloud_ready && !setup_blocks_normal_cloud_traffic()) {
+                char *heartbeat_payload =
+                    floraos_phase20_build_heartbeat("COM DEV", false);
+
+                if (heartbeat_payload != NULL) {
+                    (void)floraos_phase20_queue_message(
+                        "heartbeat",
+                        heartbeat_payload,
+                        false
+                    );
+                    floraos_phase20_free_payload(heartbeat_payload);
+                }
+            }
+
+            vTaskDelay(
+                pdMS_TO_TICKS(
+                    FLORAOS_HEARTBEAT_INTERVAL_SECONDS * 1000
+                )
+            );
+        }
+    }
+
+    i2c_master_bus_config_t bus_config = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = -1,
+        .sda_io_num = I2C_SDA_GPIO,
+        .scl_io_num = I2C_SCL_GPIO,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true
+    };
+
+    i2c_master_bus_handle_t bus_handle;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus_handle));
+
+    if (i2c_master_probe(
+            bus_handle,
+            BH1750_ADDRESS,
+            1000
+        ) != ESP_OK) {
+        ESP_LOGE(TAG, "BH1750 not found!");
+        water_pump_off();
+        return;
+    }
+
+    if (i2c_master_probe(
+            bus_handle,
+            DS3231_ADDRESS,
+            1000
+        ) != ESP_OK) {
+        ESP_LOGE(TAG, "DS3231 not found!");
+        water_pump_off();
+        return;
+    }
+
+    i2c_device_config_t bh1750_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = BH1750_ADDRESS,
+        .scl_speed_hz = 100000
+    };
+
+    ESP_ERROR_CHECK(
+        i2c_master_bus_add_device(
+            bus_handle,
+            &bh1750_config,
+            &bh1750_handle
+        )
+    );
+
+    i2c_device_config_t ds3231_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = DS3231_ADDRESS,
+        .scl_speed_hz = 100000
+    };
+
+    ESP_ERROR_CHECK(
+        i2c_master_bus_add_device(
+            bus_handle,
+            &ds3231_config,
+            &ds3231_handle
+        )
+    );
+
+    ESP_ERROR_CHECK(bh1750_init());
+    soil_moisture_init();
+
+    bool rtc_ntp_synced = false;
+
+    if (
+        wifi_manager_station_ready() &&
+        !setup_blocks_normal_cloud_traffic()
+    ) {
+        if (sync_rtc_from_ntp() == ESP_OK) {
+            rtc_ntp_synced = true;
+        }
+    }
+
+    uint32_t cloud_cycle = 0;
+
+    /*
+     * NORMAL mode sends a dedicated authenticated heartbeat every 60 seconds.
+     * Start at zero so the first heartbeat is sent as soon as normal cloud
+     * traffic becomes available after first-time setup succeeds.
+     */
+    int64_t last_heartbeat_us = 0;
+
+    while (1) {
+        float average_lux = 0.0f;
+        int average_soil = 0;
+        int soil_percent_for_cloud = -1;
+        bool soil_adc_valid = false;
+        bool soil_percent_valid = false;
+        bool pump_for_cloud = false;
+        bool light_valid = false;
+        bool rtc_valid = false;
+        rtc_time_t rtc = {0};
+
+        if (bh1750_read_average(&average_lux) == ESP_OK) {
+            light_valid = true;
+            ESP_LOGI(TAG, "Average Light: %.2f lux", average_lux);
+        }
+
+        if (ds3231_read_time(&rtc) == ESP_OK) {
+            rtc_valid = true;
+        }
+
+        if (soil_moisture_read_average(&average_soil) == ESP_OK) {
+            soil_adc_valid = true;
+
+            if (average_soil >= SOIL_OUT_OF_SOIL) {
+                floraos_phase20_set_water_lockout(true);
+                if (!floraos_phase20_water_command_active()) {
+                    water_pump_off();
+                }
+            } else {
+                floraos_phase20_set_water_lockout(false);
+
+                int soil_percent = soil_adc_to_percent(average_soil);
+                soil_percent_for_cloud = soil_percent;
+                soil_percent_valid = true;
+
+                /*
+                 * A validated cloud watering command temporarily owns the
+                 * water actua
