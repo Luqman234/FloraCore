@@ -675,4 +675,186 @@ static int terminal_gap_event(
             break;
 
         case BLE_GAP_EVENT_SUBSCRIBE:
-            i
+            if (event->subscribe.attr_handle == tx_value_handle) {
+                tx_notifications_enabled =
+                    event->subscribe.cur_notify != 0;
+            }
+            break;
+
+        case BLE_GAP_EVENT_ENC_CHANGE:
+            ESP_LOGI(
+                TAG,
+                "BLE encryption change status=%d",
+                event->enc_change.status
+            );
+            break;
+
+        case BLE_GAP_EVENT_REPEAT_PAIRING:
+            return BLE_GAP_REPEAT_PAIRING_RETRY;
+
+        default:
+            break;
+    }
+
+    return 0;
+}
+
+static void terminal_advertise(void)
+{
+    struct ble_hs_adv_fields fields = {0};
+
+    fields.flags =
+        BLE_HS_ADV_F_DISC_GEN |
+        BLE_HS_ADV_F_BREDR_UNSUP;
+
+    fields.tx_pwr_lvl_is_present = 1;
+    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+    fields.name = (uint8_t *)BLE_DEVICE_NAME;
+    fields.name_len = strlen(BLE_DEVICE_NAME);
+    fields.name_is_complete = 1;
+
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_set_fields rc=%d", rc);
+        return;
+    }
+
+    struct ble_gap_adv_params params = {0};
+    params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+
+    rc = ble_gap_adv_start(
+        own_addr_type,
+        NULL,
+        BLE_HS_FOREVER,
+        &params,
+        terminal_gap_event,
+        NULL
+    );
+
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_start rc=%d", rc);
+    }
+}
+
+static void on_reset(int reason)
+{
+    ESP_LOGW(TAG, "NimBLE reset reason=%d", reason);
+}
+
+static void on_sync(void)
+{
+    int rc = ble_hs_util_ensure_addr(0);
+    assert(rc == 0);
+
+    rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    assert(rc == 0);
+
+    terminal_advertise();
+}
+
+static void gatt_register_cb(
+    struct ble_gatt_register_ctxt *ctxt,
+    void *arg
+)
+{
+    (void)ctxt;
+    (void)arg;
+}
+
+static int gatt_init(void)
+{
+    int rc = ble_gatts_count_cfg(terminal_services);
+    if (rc != 0) return rc;
+
+    return ble_gatts_add_svcs(terminal_services);
+}
+
+static void host_task(void *parameter)
+{
+    (void)parameter;
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+esp_err_t ble_terminal_init(void)
+{
+    if (command_queue != NULL) {
+        return ESP_OK;
+    }
+
+    command_queue = xQueueCreate(
+        BLE_TERMINAL_QUEUE_DEPTH,
+        sizeof(terminal_command_t)
+    );
+    if (command_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (xTaskCreate(
+            command_task,
+            "ble_terminal",
+            BLE_TERMINAL_TASK_STACK,
+            NULL,
+            BLE_TERMINAL_TASK_PRIORITY,
+            NULL
+        ) != pdPASS) {
+        vQueueDelete(command_queue);
+        command_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t err = nimble_port_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ble_hs_cfg.reset_cb = on_reset;
+    ble_hs_cfg.sync_cb = on_sync;
+    ble_hs_cfg.gatts_register_cb = gatt_register_cb;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+
+    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist =
+        BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist =
+        BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+
+    int rc = gatt_init();
+    if (rc != 0) {
+        return ESP_FAIL;
+    }
+
+#if CONFIG_BT_NIMBLE_GAP_SERVICE
+    rc = ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
+    if (rc != 0) {
+        return ESP_FAIL;
+    }
+#endif
+
+    ble_store_config_init();
+    nimble_port_freertos_init(host_task);
+
+    ESP_LOGI(TAG, "FloraCore BLE terminal initialized");
+    return ESP_OK;
+}
+
+void ble_terminal_set_command_handler(
+    ble_terminal_command_handler_t handler
+)
+{
+    custom_command_handler = handler;
+}
+
+bool ble_terminal_is_connected(void)
+{
+    return active_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+}
+
+uint16_t ble_terminal_connection_handle(void)
+{
+    return active_conn_handle;
+}
