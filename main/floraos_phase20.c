@@ -812,4 +812,213 @@ static void process_command(cJSON *command, int64_t server_time)
         } else if (strcmp(state->valuestring, "on") == 0) {
             uint32_t duration_seconds = 0;
             if (
-                !json_u32(parameters, "duration_seconds",
+                !json_u32(parameters, "duration_seconds", &duration_seconds) ||
+                duration_seconds < PHASE20_GROW_LIGHT_MIN_SECONDS ||
+                duration_seconds > PHASE20_GROW_LIGHT_MAX_SECONDS
+            ) {
+                remember_terminal_failure(command_id, "invalid_parameters");
+                (void)send_failed(command_id, "invalid_parameters");
+                return;
+            }
+
+            action.type = ACTION_GROW_LIGHT_ON;
+            action.duration = duration_seconds;
+        } else {
+            remember_terminal_failure(command_id, "invalid_parameters");
+            (void)send_failed(command_id, "invalid_parameters");
+            return;
+        }
+#else
+        remember_terminal_failure(command_id, "local_safety_lockout");
+        (void)send_failed(command_id, "local_safety_lockout");
+        return;
+#endif
+    } else {
+        /* Includes fertilize until its physical local-safety implementation exists. */
+        remember_terminal_failure(command_id, "invalid_parameters");
+        (void)send_failed(command_id, "invalid_parameters");
+        return;
+    }
+
+    esp_err_t persist_err = ESP_FAIL;
+
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        persist_err = create_inflight_record_locked(command_id, NULL);
+        if (persist_err == ESP_OK) {
+            strlcpy(
+                s_active_command_id,
+                command_id,
+                sizeof(s_active_command_id)
+            );
+            s_active_action = action.type;
+        }
+        xSemaphoreGive(s_lock);
+    }
+
+    if (persist_err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not persist command dedupe record: %s", esp_err_to_name(persist_err));
+        (void)send_failed(command_id, "local_safety_lockout");
+        return;
+    }
+
+    (void)send_acknowledged(command_id, action.accepted_at_ms);
+
+    if (xQueueSend(s_command_queue, &action, 0) != pdTRUE) {
+        finish_failed(command_id, "actuator_fault");
+        return;
+    }
+}
+
+static void response_callback(
+    esp_err_t result,
+    const char *response_plaintext,
+    void *user_ctx
+)
+{
+    (void)user_ctx;
+
+    if (result != ESP_OK || response_plaintext == NULL || response_plaintext[0] == '\0') {
+        return;
+    }
+
+    cJSON *root = cJSON_Parse(response_plaintext);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    cJSON *commands = cJSON_GetObjectItemCaseSensitive(root, "commands");
+    if (!cJSON_IsArray(commands) || cJSON_GetArraySize(commands) == 0) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    cJSON *server_time_item = cJSON_GetObjectItemCaseSensitive(root, "server_time");
+    int64_t server_time = -1;
+    if (cJSON_IsNumber(server_time_item) && server_time_item->valuedouble >= 0) {
+        server_time = (int64_t)server_time_item->valuedouble;
+        if ((double)server_time != server_time_item->valuedouble) {
+            server_time = -1;
+        }
+    }
+
+    int count = cJSON_GetArraySize(commands);
+    if (count > 1) {
+        ESP_LOGW(TAG, "Server returned %d commands; protocol v1 executes at most one", count);
+    }
+
+    process_command(cJSON_GetArrayItem(commands, 0), server_time);
+    cJSON_Delete(root);
+}
+
+esp_err_t floraos_phase20_init(const floraos_phase20_ops_t *ops)
+{
+    if (s_initialized) return ESP_OK;
+
+    if (
+        ops == NULL ||
+        ops->setup_blocked == NULL ||
+        ops->ota_in_progress == NULL ||
+        ops->water_set == NULL ||
+        ops->water_get == NULL
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+    if (ops->grow_light_set == NULL || ops->grow_light_get == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+#endif
+
+    s_ops = *ops;
+
+    s_lock = xSemaphoreCreateMutex();
+    if (s_lock == NULL) return ESP_ERR_NO_MEM;
+
+    esp_err_t err = nvs_open(
+        PHASE20_DEDUPE_NAMESPACE,
+        NVS_READWRITE,
+        &s_nvs
+    );
+    if (err != ESP_OK) return err;
+
+    s_nvs_open = true;
+
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        recover_inflight_records_locked();
+        xSemaphoreGive(s_lock);
+    }
+
+    s_command_queue = xQueueCreate(
+        PHASE20_COMMAND_QUEUE_DEPTH,
+        sizeof(command_action_t)
+    );
+    if (s_command_queue == NULL) return ESP_ERR_NO_MEM;
+
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+    esp_timer_create_args_t timer_args = {
+        .callback = grow_light_auto_off,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "grow_light_off",
+        .skip_unhandled_events = true
+    };
+
+    err = esp_timer_create(&timer_args, &s_grow_light_timer);
+    if (err != ESP_OK) return err;
+#endif
+
+    BaseType_t task_ok = xTaskCreate(
+        command_task,
+        "flora_cmd_v1",
+        PHASE20_COMMAND_TASK_STACK,
+        NULL,
+        PHASE20_COMMAND_TASK_PRIORITY,
+        &s_command_task
+    );
+    if (task_ok != pdPASS) return ESP_ERR_NO_MEM;
+
+    s_initialized = true;
+    ESP_LOGI(TAG, "Command protocol v1 ready; fertilizer remains disabled");
+    return ESP_OK;
+}
+
+bool floraos_phase20_is_ready(void)
+{
+    return s_initialized;
+}
+
+static void add_diagnostics(cJSON *root, bool command_protocol_enabled)
+{
+    cJSON *diagnostics = cJSON_CreateObject();
+    cJSON *faults = cJSON_CreateArray();
+    if (diagnostics == NULL || faults == NULL) {
+        cJSON_Delete(diagnostics);
+        cJSON_Delete(faults);
+        return;
+    }
+
+    wifi_ap_record_t ap_info;
+    memset(&ap_info, 0, sizeof(ap_info));
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        cJSON_AddNumberToObject(diagnostics, "wifi_rssi_dbm", ap_info.rssi);
+    }
+
+    cJSON_AddNumberToObject(
+        diagnostics,
+        "uptime_seconds",
+        (double)(esp_timer_get_time() / 1000000LL)
+    );
+    cJSON_AddNumberToObject(
+        diagnostics,
+        "free_heap_bytes",
+        (double)esp_get_free_heap_size()
+    );
+    cJSON_AddNumberToObject(
+        diagnostics,
+        "min_free_heap_bytes",
+        (double)esp_get_minimum_free_heap_size()
+    );
+
+    size_t psram_free = heap_caps_get_free_size(MAL
