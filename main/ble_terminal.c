@@ -231,4 +231,240 @@ esp_err_t ble_terminal_send(uint16_t conn_handle, const char *text)
                 tx_value_handle,
                 om
             ) != 0) {
-   
+            return ESP_FAIL;
+        }
+
+        offset += chunk_length;
+        if (offset < total_length) {
+            vTaskDelay(pdMS_TO_TICKS(8));
+        }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ble_terminal_printf(
+    uint16_t conn_handle,
+    const char *format,
+    ...
+)
+{
+    if (format == NULL) return ESP_ERR_INVALID_ARG;
+
+    char buffer[BLE_TERMINAL_TX_MAX];
+
+    va_list args;
+    va_start(args, format);
+    int rc = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    if (rc < 0) return ESP_FAIL;
+    buffer[sizeof(buffer) - 1] = '\0';
+
+    return ble_terminal_send(conn_handle, buffer);
+}
+
+static void command_help(uint16_t conn_handle)
+{
+    ble_terminal_send(
+        conn_handle,
+        "\r\nFloraCore commands\r\n"
+        "------------------\r\n"
+        "help\r\n"
+        "info\r\n"
+        "status\r\n"
+        "uptime\r\n"
+        "wifi list\r\n"
+        "wifi add <SSID>|<PASSWORD>\r\n"
+        "wifi erase\r\n"
+        "wifi connect\r\n"
+        "device id\r\n"
+        "claim <ONE-TIME-TOKEN>\r\n"
+        "setup start\r\n"
+        "setup status\r\n"
+        "init com dev\r\n"
+        "init normal\r\n"
+        "reboot\r\n\r\n"
+    );
+}
+
+static void command_info(uint16_t conn_handle)
+{
+    ble_terminal_printf(
+        conn_handle,
+        "Device: FloraCore\r\n"
+        "ESP-IDF: %s\r\n"
+        "Free heap: %lu bytes\r\n",
+        esp_get_idf_version(),
+        (unsigned long)esp_get_free_heap_size()
+    );
+}
+
+static void command_status(uint16_t conn_handle)
+{
+    wifi_credentials_load();
+    floracore_mode_t mode = system_mode_load();
+    bool ready = floraos_client_is_ready();
+
+    ble_terminal_printf(
+        conn_handle,
+        "\r\nBLE connected: yes\r\n"
+        "TX notifications: %s\r\n"
+        "Boot mode: %s\r\n"
+        "Saved Wi-Fi networks: %u\r\n"
+        "Wi-Fi station ready: %s\r\n"
+        "FloraOS secure client: %s\r\n"
+        "Device ID: %s\r\n\r\n",
+        tx_notifications_enabled ? "yes" : "no",
+        system_mode_name(mode),
+        (unsigned)known_network_count,
+        wifi_manager_station_ready() ? "yes" : "no",
+        ready ? "ready" : "not initialized",
+        ready ? floraos_client_device_id() : "available after FloraOS init"
+    );
+}
+
+static void command_uptime(uint16_t conn_handle)
+{
+    uint64_t seconds = (uint64_t)esp_timer_get_time() / 1000000ULL;
+    ble_terminal_printf(
+        conn_handle,
+        "Uptime: %llu d %02llu:%02llu:%02llu\r\n",
+        (unsigned long long)(seconds / 86400ULL),
+        (unsigned long long)((seconds % 86400ULL) / 3600ULL),
+        (unsigned long long)((seconds % 3600ULL) / 60ULL),
+        (unsigned long long)(seconds % 60ULL)
+    );
+}
+
+static void command_wifi_list(uint16_t conn_handle)
+{
+    if (!wifi_credentials_load()) {
+        ble_terminal_send(conn_handle, "No Wi-Fi credentials saved.\r\n");
+        return;
+    }
+
+    ble_terminal_printf(
+        conn_handle,
+        "Saved Wi-Fi networks (%u):\r\n",
+        (unsigned)known_network_count
+    );
+
+    for (size_t i = 0; i < known_network_count; i++) {
+        ble_terminal_printf(
+            conn_handle,
+            "  %u. %s\r\n",
+            (unsigned)(i + 1),
+            known_networks[i].ssid
+        );
+    }
+}
+
+static void command_wifi_add(uint16_t conn_handle, const char *arguments)
+{
+    if (arguments == NULL || arguments[0] == '\0') {
+        ble_terminal_send(
+            conn_handle,
+            "Usage: wifi add <SSID>|<PASSWORD>\r\n"
+        );
+        return;
+    }
+
+    char buffer[BLE_TERMINAL_LINE_MAX];
+    strlcpy(buffer, arguments, sizeof(buffer));
+
+    char *separator = strchr(buffer, '|');
+    if (separator == NULL) {
+        memset(buffer, 0, sizeof(buffer));
+        ble_terminal_send(
+            conn_handle,
+            "Missing '|'. Example: wifi add Home WiFi|password\r\n"
+        );
+        return;
+    }
+
+    *separator = '\0';
+    const char *ssid = buffer;
+    const char *password = separator + 1;
+
+    esp_err_t err = wifi_credentials_save(ssid, password);
+    if (err == ESP_OK) {
+        ble_terminal_printf(
+            conn_handle,
+            "Saved Wi-Fi credential for: %s\r\n",
+            ssid
+        );
+    } else {
+        ble_terminal_printf(
+            conn_handle,
+            "Could not save Wi-Fi credential: %s\r\n",
+            esp_err_to_name(err)
+        );
+    }
+
+    memset(buffer, 0, sizeof(buffer));
+}
+
+static void command_wifi_erase(uint16_t conn_handle)
+{
+    esp_err_t err = wifi_credentials_erase_all();
+
+    if (err != ESP_OK) {
+        ble_terminal_printf(
+            conn_handle,
+            "Could not erase Wi-Fi credentials: %s\r\n",
+            esp_err_to_name(err)
+        );
+        return;
+    }
+
+    ble_terminal_send(
+        conn_handle,
+        "All saved Wi-Fi credentials erased.\r\n"
+    );
+
+    esp_err_t setup_err = setup_portal_start();
+    if (setup_err == ESP_OK) {
+        ble_terminal_send(
+            conn_handle,
+            "Consumer setup portal started. Join FloraCore-XXXXXX Wi-Fi.\r\n"
+        );
+    } else {
+        ble_terminal_printf(
+            conn_handle,
+            "Wi-Fi erased, but setup portal start failed: %s\r\n",
+            esp_err_to_name(setup_err)
+        );
+    }
+}
+
+static void command_wifi_connect(uint16_t conn_handle)
+{
+    ble_terminal_send(
+        conn_handle,
+        "Scanning saved networks and connecting to Wi-Fi...\r\n"
+    );
+
+    if (!wifi_manager_connect()) {
+        ble_terminal_send(
+            conn_handle,
+            "Could not connect to a saved Wi-Fi network.\r\n"
+        );
+        return;
+    }
+
+    ble_terminal_send(
+        conn_handle,
+        "Wi-Fi connected and DHCP completed. FloraOS will verify service reachability.\r\n"
+    );
+
+    esp_err_t err = floraos_client_init();
+    if (err == ESP_OK) {
+        ble_terminal_printf(
+            conn_handle,
+            "FloraOS secure client ready. Device ID: %s\r\n",
+            floraos_client_device_id()
+        );
+    } else {
+        ble_terminal_printf(
+            conn_ha
