@@ -452,4 +452,153 @@ wifi_manager_connect_result_t wifi_manager_connect_credentials(
     vTaskDelay(pdMS_TO_TICKS(250));
 
     xEventGroupClearBits(
-        wifi_eve
+        wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAILED_BIT
+    );
+
+    wifi_config_t config = {0};
+    strlcpy((char *)config.sta.ssid, ssid, sizeof(config.sta.ssid));
+    strlcpy((char *)config.sta.password, password, sizeof(config.sta.password));
+    config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    if (err != ESP_OK) {
+        return WIFI_MANAGER_CONNECT_FAILED;
+    }
+
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        return WIFI_MANAGER_CONNECT_FAILED;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(
+        wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAILED_BIT,
+        pdTRUE,
+        pdFALSE,
+        pdMS_TO_TICKS(15000)
+    );
+
+    if ((bits & WIFI_CONNECTED_BIT) == 0) {
+        if (bits & WIFI_FAILED_BIT) {
+            return classify_disconnect();
+        }
+        return WIFI_MANAGER_CONNECT_TIMEOUT;
+    }
+
+    /*
+     * Receiving an IP address means Wi-Fi provisioning succeeded.
+     * Do not block setup on a Google/ICMP connectivity probe. The next
+     * encrypted FloraOS claim is the authoritative service-reachability
+     * check.
+     */
+    s_station_ready = true;
+    ESP_LOGI(TAG, "Wi-Fi provisioning succeeded; proceeding directly to FloraOS claim");
+    return WIFI_MANAGER_CONNECT_OK;
+}
+
+esp_err_t wifi_manager_start_setup_ap(
+    const char *ssid,
+    const char *password
+)
+{
+    if (!wifi_initialized || !valid_ssid(ssid) || password == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t password_len = strlen(password);
+    if (password_len != 0 && (password_len < 8 || password_len > 63)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) return err;
+
+    wifi_config_t ap_config = {0};
+    strlcpy((char *)ap_config.ap.ssid, ssid, sizeof(ap_config.ap.ssid));
+    ap_config.ap.ssid_len = strlen(ssid);
+    ap_config.ap.channel = 1;
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.pmf_cfg.required = false;
+
+    if (password_len == 0) {
+        ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    } else {
+        strlcpy(
+            (char *)ap_config.ap.password,
+            password,
+            sizeof(ap_config.ap.password)
+        );
+        ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    }
+
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (err != ESP_OK) return err;
+
+    esp_netif_t *ap_netif =
+        esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+
+    if (ap_netif != NULL) {
+        esp_netif_ip_info_t ip_info = {0};
+        esp_netif_set_ip4_addr(&ip_info.ip, 192, 168, 4, 1);
+        esp_netif_set_ip4_addr(&ip_info.gw, 192, 168, 4, 1);
+        esp_netif_set_ip4_addr(&ip_info.netmask, 255, 255, 255, 0);
+
+        (void)esp_netif_dhcps_stop(ap_netif);
+        err = esp_netif_set_ip_info(ap_netif, &ip_info);
+        if (err != ESP_OK) {
+            (void)esp_netif_dhcps_start(ap_netif);
+            return err;
+        }
+        (void)esp_netif_dhcps_start(ap_netif);
+    }
+
+    s_setup_ap_active = true;
+    ESP_LOGI(TAG, "Setup SoftAP active: %s", ssid);
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_stop_setup_ap(void)
+{
+    if (!wifi_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!s_setup_ap_active) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err == ESP_OK) {
+        s_setup_ap_active = false;
+        ESP_LOGI(TAG, "Setup SoftAP stopped; STA remains enabled");
+    }
+
+    return err;
+}
+
+bool wifi_manager_setup_ap_active(void)
+{
+    return s_setup_ap_active;
+}
+
+const char *wifi_manager_connect_result_name(
+    wifi_manager_connect_result_t result
+)
+{
+    switch (result) {
+        case WIFI_MANAGER_CONNECT_OK:
+            return "ok";
+        case WIFI_MANAGER_CONNECT_AUTH_FAILED:
+            return "wifi_auth_failed";
+        case WIFI_MANAGER_CONNECT_NO_AP:
+            return "wifi_not_found";
+        case WIFI_MANAGER_CONNECT_NO_INTERNET:
+            return "no_internet";
+        case WIFI_MANAGER_CONNECT_TIMEOUT:
+            return "wifi_timeout";
+        default:
+            return "wifi_failed";
+    }
+}
