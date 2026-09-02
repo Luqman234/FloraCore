@@ -518,4 +518,38 @@ static esp_err_t start_http_server(void)
     config.max_uri_handlers = 12;
     config.lru_purge_enable = true;
 
-    esp_err_t err = httpd_start(&s
+    esp_err_t err = httpd_start(&s_http_server, &config);
+    if (err != ESP_OK) return err;
+
+    const httpd_uri_t routes[] = {
+        {.uri = "/", .method = HTTP_GET, .handler = root_handler},
+        {.uri = "/api/setup/networks", .method = HTTP_GET, .handler = networks_handler},
+        {.uri = "/api/setup/connect", .method = HTTP_POST, .handler = connect_handler},
+        {.uri = "/api/setup/status", .method = HTTP_GET, .handler = status_handler},
+
+        {.uri = "/generate_204", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/gen_204", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/ncsi.txt", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/nm-check.txt", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/canonical.html", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/success.txt", .method = HTTP_GET, .handler = redirect_handler}
+    };
+
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            httpd_register_uri_handler(s_http_server, &routes[i])
+        );
+    }
+
+    return ESP_OK;
+}
+
+static void stop_http_server(void)
+{
+    if (s_http_server != NULL) {
+        httpd_handle_t server = s_http_server;
+        s_http_server = NULL;
+        (void)httpd_stop(server);
+    }
