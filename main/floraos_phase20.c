@@ -636,4 +636,180 @@ static bool json_u32(cJSON *object, const char *key, uint32_t *value)
         return false;
     }
 
-    double raw = item
+    double raw = item->valuedouble;
+    uint32_t converted = (uint32_t)raw;
+    if ((double)converted != raw) return false;
+
+    *value = converted;
+    return true;
+}
+
+static void remember_terminal_failure(const char *command_id, const char *error)
+{
+    if (s_lock != NULL && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        (void)update_record_locked(command_id, RECORD_FAILED, error, 0);
+        xSemaphoreGive(s_lock);
+    }
+}
+
+static void process_command(cJSON *command, int64_t server_time)
+{
+    if (!cJSON_IsObject(command)) return;
+
+    cJSON *id_item = cJSON_GetObjectItemCaseSensitive(command, "id");
+    cJSON *type_item = cJSON_GetObjectItemCaseSensitive(command, "type");
+    cJSON *parameters = cJSON_GetObjectItemCaseSensitive(command, "parameters");
+    cJSON *expires_item = cJSON_GetObjectItemCaseSensitive(command, "expires_at");
+
+    if (!cJSON_IsString(id_item) || !valid_command_id(id_item->valuestring)) {
+        ESP_LOGW(TAG, "Ignoring command with invalid command_id");
+        return;
+    }
+
+    const char *command_id = id_item->valuestring;
+
+    dedupe_record_t prior;
+    bool same_active = false;
+    bool another_active = false;
+
+    if (s_lock != NULL && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        bool found = find_record_locked(command_id, &prior);
+        if (!found) memset(&prior, 0, sizeof(prior));
+
+        if (s_active_command_id[0] != '\0') {
+            same_active = strcmp(s_active_command_id, command_id) == 0;
+            another_active = !same_active;
+        }
+
+        xSemaphoreGive(s_lock);
+    } else {
+        return;
+    }
+
+    if (prior.found) {
+        if (prior.status == RECORD_COMPLETED) {
+            uint64_t now = monotonic_ms();
+            (void)send_completed(
+                command_id,
+                now,
+                now,
+                prior.actual_duration_ms,
+                0
+            );
+            return;
+        }
+
+        if (prior.status == RECORD_FAILED) {
+            (void)send_failed(
+                command_id,
+                prior.error[0] != '\0'
+                    ? prior.error
+                    : "local_safety_lockout"
+            );
+            return;
+        }
+
+        if (prior.status == RECORD_INFLIGHT) {
+            if (same_active) {
+                (void)send_acknowledged(command_id, monotonic_ms());
+            } else {
+                /* Should only happen after an interrupted/rebooted execution. */
+                remember_terminal_failure(command_id, "local_safety_lockout");
+                (void)send_failed(command_id, "local_safety_lockout");
+            }
+            return;
+        }
+    }
+
+    if (another_active) {
+        remember_terminal_failure(command_id, "local_safety_lockout");
+        (void)send_failed(command_id, "local_safety_lockout");
+        return;
+    }
+
+    if (setup_blocked_now()) {
+        remember_terminal_failure(command_id, "setup_in_progress");
+        (void)send_failed(command_id, "setup_in_progress");
+        return;
+    }
+
+    if (ota_in_progress_now()) {
+        remember_terminal_failure(command_id, "ota_in_progress");
+        (void)send_failed(command_id, "ota_in_progress");
+        return;
+    }
+
+    if (
+        !cJSON_IsNumber(expires_item) ||
+        expires_item->valuedouble < 0 ||
+        server_time < 0
+    ) {
+        remember_terminal_failure(command_id, "invalid_parameters");
+        (void)send_failed(command_id, "invalid_parameters");
+        return;
+    }
+
+    int64_t expires_at = (int64_t)expires_item->valuedouble;
+    if ((double)expires_at != expires_item->valuedouble || expires_at <= server_time) {
+        remember_terminal_failure(command_id, "invalid_parameters");
+        (void)send_failed(command_id, "invalid_parameters");
+        return;
+    }
+
+    if (!cJSON_IsString(type_item) || !cJSON_IsObject(parameters)) {
+        remember_terminal_failure(command_id, "invalid_parameters");
+        (void)send_failed(command_id, "invalid_parameters");
+        return;
+    }
+
+    command_action_t action;
+    memset(&action, 0, sizeof(action));
+    strlcpy(action.command_id, command_id, sizeof(action.command_id));
+    action.accepted_at_ms = monotonic_ms();
+
+    if (strcmp(type_item->valuestring, "water") == 0) {
+        uint32_t duration_ms = 0;
+        if (
+            !json_u32(parameters, "duration_ms", &duration_ms) ||
+            duration_ms < PHASE20_WATER_MIN_MS ||
+            duration_ms > PHASE20_WATER_MAX_MS
+        ) {
+            remember_terminal_failure(command_id, "invalid_parameters");
+            (void)send_failed(command_id, "invalid_parameters");
+            return;
+        }
+
+        if (water_lockout_now()) {
+            remember_terminal_failure(command_id, "local_safety_lockout");
+            (void)send_failed(command_id, "local_safety_lockout");
+            return;
+        }
+
+        /*
+         * Do not claim a bounded cloud watering duration when the local
+         * controller had already energized the pump before this command.
+         */
+        if (s_ops.water_get != NULL && s_ops.water_get()) {
+            remember_terminal_failure(command_id, "local_safety_lockout");
+            (void)send_failed(command_id, "local_safety_lockout");
+            return;
+        }
+
+        action.type = ACTION_WATER;
+        action.duration = duration_ms;
+    } else if (strcmp(type_item->valuestring, "grow_light") == 0) {
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+        cJSON *state = cJSON_GetObjectItemCaseSensitive(parameters, "state");
+        if (!cJSON_IsString(state)) {
+            remember_terminal_failure(command_id, "invalid_parameters");
+            (void)send_failed(command_id, "invalid_parameters");
+            return;
+        }
+
+        if (strcmp(state->valuestring, "off") == 0) {
+            action.type = ACTION_GROW_LIGHT_OFF;
+            action.duration = 0;
+        } else if (strcmp(state->valuestring, "on") == 0) {
+            uint32_t duration_seconds = 0;
+            if (
+                !json_u32(parameters, "duration_seconds",
