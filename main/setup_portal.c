@@ -619,4 +619,73 @@ static void dns_server_task(void *parameter)
             int label = request[pos];
             pos += label + 1;
         }
-   
+        pos++;
+
+        if (pos + 4 > len || pos + 16 > (int)sizeof(response)) {
+            continue;
+        }
+
+        pos += 4;
+
+        response[pos++] = 0xC0;
+        response[pos++] = 0x0C;
+        response[pos++] = 0x00;
+        response[pos++] = 0x01;
+        response[pos++] = 0x00;
+        response[pos++] = 0x01;
+        response[pos++] = 0x00;
+        response[pos++] = 0x00;
+        response[pos++] = 0x00;
+        response[pos++] = 0x1E;
+        response[pos++] = 0x00;
+        response[pos++] = 0x04;
+        response[pos++] = 192;
+        response[pos++] = 168;
+        response[pos++] = 4;
+        response[pos++] = 1;
+
+        sendto(
+            sock,
+            response,
+            (size_t)pos,
+            0,
+            (struct sockaddr *)&client,
+            client_len
+        );
+    }
+
+    close(sock);
+    s_dns_socket = -1;
+    s_dns_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static esp_err_t start_dns_server(void)
+{
+    if (s_dns_task != NULL) return ESP_OK;
+
+    if (xTaskCreate(
+            dns_server_task,
+            "flora_dns",
+            SETUP_DNS_STACK,
+            NULL,
+            SETUP_TASK_PRIORITY,
+            &s_dns_task
+        ) != pdPASS) {
+        s_dns_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+static void stop_dns_server(void)
+{
+    s_dns_running = false;
+
+    if (s_dns_socket >= 0) {
+        shutdown(s_dns_socket, SHUT_RDWR);
+    }
+
+    for (int i = 0; i < 20 && s_dns_task != NULL; i++) {
+        vTaskDelay(pdMS_
