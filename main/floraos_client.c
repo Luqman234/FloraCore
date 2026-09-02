@@ -245,4 +245,224 @@ static esp_err_t floraos_start_worker(void)
         return ESP_ERR_NO_MEM;
     }
 
-    BaseType_t result = xTaskCreatePinn
+    BaseType_t result = xTaskCreatePinnedToCore(
+        floraos_worker_task,
+        "floraos_https",
+        FLORAOS_WORKER_STACK_SIZE,
+        NULL,
+        FLORAOS_WORKER_PRIORITY,
+        &s_worker_task,
+        FLORAOS_WORKER_CORE
+    );
+
+    if (result != pdPASS) {
+        vQueueDelete(s_worker_queue);
+        s_worker_queue = NULL;
+        s_worker_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t floraos_client_queue_message_with_callback(
+    const char *type,
+    const char *payload_json,
+    floraos_client_result_cb_t callback,
+    void *user_ctx
+)
+{
+    if (!s_initialized || s_worker_queue == NULL ||
+        type == NULL || payload_json == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    size_t type_length = strlen(type);
+    size_t payload_length = strlen(payload_json);
+
+    if (type_length == 0 || type_length >= FLORAOS_QUEUED_TYPE_MAX ||
+        payload_length == 0 || payload_length >= FLORAOS_QUEUED_PAYLOAD_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    floraos_queued_message_t *message = floraos_alloc(sizeof(*message));
+    if (message == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    strlcpy(message->type, type, sizeof(message->type));
+    strlcpy(message->payload, payload_json, sizeof(message->payload));
+    message->callback = callback;
+    message->user_ctx = user_ctx;
+
+    if (xQueueSend(s_worker_queue, &message, pdMS_TO_TICKS(100)) != pdTRUE) {
+        secure_free(message, sizeof(*message));
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t floraos_client_queue_message(
+    const char *type,
+    const char *payload_json
+)
+{
+    return floraos_client_queue_message_with_callback(
+        type,
+        payload_json,
+        NULL,
+        NULL
+    );
+}
+
+esp_err_t floraos_client_init(void)
+{
+    while (1) {
+        taskENTER_CRITICAL(&s_init_lock);
+
+        if (s_initialized) {
+            taskEXIT_CRITICAL(&s_init_lock);
+            return ESP_OK;
+        }
+
+        if (!s_initializing) {
+            s_initializing = true;
+            taskEXIT_CRITICAL(&s_init_lock);
+            break;
+        }
+
+        taskEXIT_CRITICAL(&s_init_lock);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    esp_err_t err = floraos_crypto_init();
+    if (err == ESP_OK) {
+        err = floraos_start_worker();
+    }
+
+    taskENTER_CRITICAL(&s_init_lock);
+    if (err == ESP_OK) {
+        s_initialized = true;
+    }
+    s_initializing = false;
+    taskEXIT_CRITICAL(&s_init_lock);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ESP_LOGI(TAG, "FloraOS secure client ready");
+    ESP_LOGI(TAG, "Device ID: %s", floraos_crypto_device_id());
+    return ESP_OK;
+}
+
+bool floraos_client_is_ready(void)
+{
+    return s_initialized && s_worker_queue != NULL && s_worker_task != NULL;
+}
+
+const char *floraos_client_device_id(void)
+{
+    return floraos_crypto_device_id();
+}
+
+esp_err_t floraos_client_send_message(
+    const char *type,
+    const char *payload_json,
+    char *response_plaintext,
+    size_t response_capacity
+)
+{
+    if (!s_initialized || type == NULL || payload_json == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = ESP_OK;
+    esp_http_client_handle_t client = NULL;
+
+    char *plaintext = floraos_alloc(MAX_PLAINTEXT);
+    uint8_t *ciphertext = floraos_alloc(MAX_CIPHERTEXT);
+    char *ciphertext_hex = floraos_alloc(MAX_CIPHERTEXT * 2 + 1);
+    char *body = floraos_alloc(MAX_OUTER_JSON);
+    http_response_buffer_t *response = floraos_alloc(sizeof(*response));
+    char *response_nonce_hex = floraos_alloc(FLORAOS_NONCE_LEN * 2 + 1);
+    char *response_ciphertext_hex = floraos_alloc(MAX_HTTP_RESPONSE);
+    uint8_t *response_ciphertext = floraos_alloc(MAX_HTTP_RESPONSE / 2);
+    uint8_t *decrypted = floraos_alloc(MAX_HTTP_RESPONSE / 2);
+
+    if (plaintext == NULL || ciphertext == NULL || ciphertext_hex == NULL ||
+        body == NULL || response == NULL || response_nonce_hex == NULL ||
+        response_ciphertext_hex == NULL || response_ciphertext == NULL ||
+        decrypted == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    uint8_t message_id[FLORAOS_MESSAGE_ID_LEN];
+    uint8_t nonce[FLORAOS_NONCE_LEN];
+    char message_id_hex[FLORAOS_MESSAGE_ID_LEN * 2 + 1];
+    char nonce_hex[FLORAOS_NONCE_LEN * 2 + 1];
+
+    err = floraos_crypto_random(message_id, sizeof(message_id));
+    if (err != ESP_OK) goto cleanup;
+
+    err = floraos_crypto_random(nonce, sizeof(nonce));
+    if (err != ESP_OK) goto cleanup;
+
+    floraos_hex_encode(message_id, sizeof(message_id), message_id_hex);
+    floraos_hex_encode(nonce, sizeof(nonce), nonce_hex);
+
+    time_t now = time(NULL);
+    long long unix_time = (now > 1700000000) ? (long long)now : 0;
+
+    int plaintext_len = snprintf(
+        plaintext,
+        MAX_PLAINTEXT,
+        "{\"message_id\":\"%s\",\"ts\":%lld,\"type\":\"%s\",\"payload\":%s}",
+        message_id_hex,
+        unix_time,
+        type,
+        payload_json
+    );
+    if (plaintext_len <= 0 || plaintext_len >= MAX_PLAINTEXT) {
+        err = ESP_ERR_INVALID_SIZE;
+        goto cleanup;
+    }
+
+    char aad[192];
+    err = make_aad("d2s", aad, sizeof(aad));
+    if (err != ESP_OK) goto cleanup;
+
+    size_t ciphertext_len = 0;
+    err = floraos_crypto_encrypt_d2s(
+        nonce,
+        (const uint8_t *)aad,
+        strlen(aad),
+        (const uint8_t *)plaintext,
+        (size_t)plaintext_len,
+        ciphertext,
+        MAX_CIPHERTEXT,
+        &ciphertext_len
+    );
+    if (err != ESP_OK) goto cleanup;
+
+    floraos_hex_encode(ciphertext, ciphertext_len, ciphertext_hex);
+
+    int body_len = snprintf(
+        body,
+        MAX_OUTER_JSON,
+        "{\"v\":%d,\"device_id\":\"%s\",\"nonce\":\"%s\",\"ciphertext\":\"%s\"}",
+        FLORAOS_PROTOCOL_VERSION,
+        floraos_crypto_device_id(),
+        nonce_hex,
+        ciphertext_hex
+    );
+    if (body_len <= 0 || body_len >= MAX_OUTER_JSON) {
+        err = ESP_ERR_INVALID_SIZE;
+        goto cleanup;
+    }
+
+    esp_http_client_config_t config = {
+        .url = FLORAOS_ENDPOINT,
+ 
