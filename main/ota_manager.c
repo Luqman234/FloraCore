@@ -782,4 +782,188 @@ esp_err_t ota_manager_start_update(
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (!o
+    if (!ota_url_is_allowed(url)) {
+        ESP_LOGE(
+            TAG,
+            "Rejected OTA URL outside FloraOS firmware origin"
+        );
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (
+        strlen(url) >= OTA_REQUEST_URL_MAX ||
+        strlen(expected_version) >=
+            OTA_REQUEST_VERSION_MAX
+    ) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    unsigned long major = 0;
+    unsigned long minor = 0;
+    unsigned long patch = 0;
+
+    if (
+        !parse_semver_core(
+            expected_version,
+            &major,
+            &minor,
+            &patch
+        )
+    ) {
+        ESP_LOGE(
+            TAG,
+            "Expected OTA version must use stable X.Y.Z format"
+        );
+
+        return ESP_ERR_INVALID_VERSION;
+    }
+
+    (void)major;
+    (void)minor;
+    (void)patch;
+
+    if (s_pending_verify) {
+        ESP_LOGE(
+            TAG,
+            "Cannot install another OTA while current image is pending verification"
+        );
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    taskENTER_CRITICAL(&s_update_lock);
+
+    if (s_update_in_progress) {
+        taskEXIT_CRITICAL(&s_update_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_update_in_progress = true;
+
+    taskEXIT_CRITICAL(&s_update_lock);
+
+    ota_update_request_t *request =
+        calloc(
+            1,
+            sizeof(*request)
+        );
+
+    if (request == NULL) {
+        set_update_in_progress(false);
+        return ESP_ERR_NO_MEM;
+    }
+
+    strlcpy(
+        request->url,
+        url,
+        sizeof(request->url)
+    );
+
+    strlcpy(
+        request->expected_version,
+        expected_version,
+        sizeof(request->expected_version)
+    );
+
+    BaseType_t task_created =
+        xTaskCreate(
+            ota_update_task,
+            "flora_ota",
+            OTA_TASK_STACK,
+            request,
+            OTA_TASK_PRIORITY,
+            NULL
+        );
+
+    if (task_created != pdPASS) {
+        free(request);
+        set_update_in_progress(false);
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "OTA update task queued for %s",
+        expected_version
+    );
+
+    return ESP_OK;
+}
+
+
+esp_err_t ota_manager_mark_valid(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!s_pending_verify) {
+        return ESP_OK;
+    }
+
+    esp_err_t err =
+        esp_ota_mark_app_valid_cancel_rollback();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not mark OTA candidate valid: %s",
+            esp_err_to_name(err)
+        );
+
+        return err;
+    }
+
+    s_pending_verify = false;
+
+    ESP_LOGI(
+        TAG,
+        "OTA candidate accepted and marked VALID"
+    );
+
+    return ESP_OK;
+}
+
+
+esp_err_t ota_manager_rollback_and_reboot(
+    const char *reason
+)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!s_pending_verify) {
+        ESP_LOGE(
+            TAG,
+            "Rollback requested while no OTA candidate is pending"
+        );
+
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGE(
+        TAG,
+        "OTA candidate rejected: %s",
+        (
+            reason != NULL &&
+            reason[0] != '\0'
+        )
+            ? reason
+            : "startup health check failed"
+    );
+
+    ESP_LOGE(
+        TAG,
+        "Marking current image INVALID and rebooting to the previous valid firmware"
+    );
+
+    /*
+     * On success ESP-IDF restarts the device and this call does not return.
+     * If it does return, propagate the error so the caller can fail loudly;
+     * leaving a candidate silently pending would be unsafe.
+     */
+    return
+        esp_ota_mark_app_invalid_rollback_and_reboot();
+}
