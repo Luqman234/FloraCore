@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# ESP-IDF / FloraCore firmware local state
+build/
+sdkconfig
+sdkconfig.old
+.venv/
+.vscode/
+.upload/
+*.bin
+*.elf
+*.map
+*.o
+*.a
