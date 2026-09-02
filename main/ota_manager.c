@@ -513,4 +513,273 @@ static void ota_update_task(void *parameter)
             ota_handle
         )
     ) {
-        E
+        ESP_LOGE(
+            TAG,
+            "OTA transfer ended without receiving the complete image"
+        );
+
+        final_err = ESP_ERR_INVALID_SIZE;
+        goto cleanup;
+    }
+
+    final_err =
+        esp_https_ota_finish(
+            ota_handle
+        );
+
+    ota_handle = NULL;
+    ota_started = false;
+
+    if (final_err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "OTA image final validation/install failed: %s",
+            esp_err_to_name(final_err)
+        );
+
+        goto cleanup;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "OTA image %s installed successfully",
+        request->expected_version
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Rebooting into candidate firmware; rollback health validation will run on next boot"
+    );
+
+    free(request);
+    request = NULL;
+
+    /*
+     * Clear the busy flag before restart so state is internally consistent if
+     * esp_restart() is intercepted during a debugger session.
+     */
+    set_update_in_progress(false);
+
+    vTaskDelay(pdMS_TO_TICKS(750));
+    esp_restart();
+
+    /*
+     * esp_restart() normally never returns.
+     */
+    vTaskDelete(NULL);
+    return;
+
+cleanup:
+    if (
+        ota_started &&
+        ota_handle != NULL
+    ) {
+        esp_err_t abort_err =
+            esp_https_ota_abort(
+                ota_handle
+            );
+
+        if (abort_err != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "OTA cleanup returned: %s",
+                esp_err_to_name(abort_err)
+            );
+        }
+    }
+
+    ESP_LOGE(
+        TAG,
+        "OTA update aborted; current firmware remains active (%s)",
+        esp_err_to_name(final_err)
+    );
+
+    free(request);
+    set_update_in_progress(false);
+    vTaskDelete(NULL);
+}
+
+
+const char *ota_manager_get_version(void)
+{
+    const esp_app_desc_t *description =
+        esp_app_get_description();
+
+    if (
+        description == NULL ||
+        description->version[0] == '\0'
+    ) {
+        return "unknown";
+    }
+
+    return description->version;
+}
+
+
+void ota_manager_log_boot_info(void)
+{
+    const esp_partition_t *running =
+        esp_ota_get_running_partition();
+
+    const esp_partition_t *boot =
+        esp_ota_get_boot_partition();
+
+    ESP_LOGI(
+        TAG,
+        "FloraCore firmware version: %s",
+        ota_manager_get_version()
+    );
+
+    if (running != NULL) {
+        ESP_LOGI(
+            TAG,
+            "Running partition: %s @ 0x%08lx (%lu bytes)",
+            running->label,
+            (unsigned long)running->address,
+            (unsigned long)running->size
+        );
+    } else {
+        ESP_LOGW(
+            TAG,
+            "Running application partition could not be identified"
+        );
+    }
+
+    if (boot != NULL) {
+        ESP_LOGI(
+            TAG,
+            "Configured boot partition: %s",
+            boot->label
+        );
+    } else {
+        ESP_LOGW(
+            TAG,
+            "Configured boot partition could not be identified"
+        );
+    }
+
+    if (running == NULL) {
+        return;
+    }
+
+    esp_ota_img_states_t state =
+        ESP_OTA_IMG_UNDEFINED;
+
+    esp_err_t err =
+        esp_ota_get_state_partition(
+            running,
+            &state
+        );
+
+    if (err == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "Running OTA state: %s",
+            ota_state_name(state)
+        );
+    } else {
+        /*
+         * This can be normal for an image that was installed by USB before
+         * the OTA metadata has ever been used. Do not treat it as a fatal
+         * boot error.
+         */
+        ESP_LOGI(
+            TAG,
+            "Running OTA state is not available yet: %s",
+            esp_err_to_name(err)
+        );
+    }
+}
+
+
+esp_err_t ota_manager_init(void)
+{
+    if (s_initialized) {
+        return ESP_OK;
+    }
+
+    const esp_partition_t *running =
+        esp_ota_get_running_partition();
+
+    if (running == NULL) {
+        ESP_LOGE(
+            TAG,
+            "Could not identify running application partition"
+        );
+
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    s_pending_verify = false;
+    set_update_in_progress(false);
+
+    esp_ota_img_states_t state =
+        ESP_OTA_IMG_UNDEFINED;
+
+    esp_err_t state_err =
+        esp_ota_get_state_partition(
+            running,
+            &state
+        );
+
+    if (
+        state_err == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY
+    ) {
+        s_pending_verify = true;
+
+        ESP_LOGW(
+            TAG,
+            "OTA candidate is PENDING_VERIFY"
+        );
+
+        ESP_LOGW(
+            TAG,
+            "FloraCore must pass its startup health gate before this image is accepted"
+        );
+    } else if (state_err != ESP_OK) {
+        /*
+         * A first USB-installed image can legitimately have no meaningful
+         * OTA state yet. Continue booting normally.
+         */
+        ESP_LOGI(
+            TAG,
+            "No pending OTA verification state (%s)",
+            esp_err_to_name(state_err)
+        );
+    }
+
+    s_initialized = true;
+
+    ota_manager_log_boot_info();
+
+    return ESP_OK;
+}
+
+
+bool ota_manager_is_pending_verify(void)
+{
+    return
+        s_initialized &&
+        s_pending_verify;
+}
+
+
+esp_err_t ota_manager_start_update(
+    const char *url,
+    const char *expected_version
+)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (
+        url == NULL ||
+        expected_version == NULL ||
+        expected_version[0] == '\0'
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!o
