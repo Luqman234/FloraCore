@@ -118,4 +118,193 @@ static const char SETUP_PAGE[] =
 "btn.onclick=async()=>{let ssid=sel.value==='__manual__'?manual.value:sel.value;"
 "if(!ssid||!tok.value){status.textContent='Choose Wi-Fi and paste your Connection Code.';return}"
 "btn.disabled=true;status.textContent='Saving settings…';let body=new URLSearchParams({ssid,password:pw.value,token:tok.value});"
-"try{let r=await fetch('/ap
+"try{let r=await fetch('/api/setup/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});"
+"let j=await r.json();if(!r.ok){status.textContent=j.message||'Could not start setup.';btn.disabled=false;return}"
+"pw.value='';tok.value='';poll()}catch(e){status.textContent='Could not reach FloraCore. Stay connected to the FloraCore Wi-Fi and try again.';btn.disabled=false}};"
+"networks();"
+"</script></main></body></html>";
+
+static void secure_zero(void *ptr, size_t size)
+{
+    if (ptr != NULL && size > 0) {
+        mbedtls_platform_zeroize(ptr, size);
+    }
+}
+
+static esp_err_t setup_pending_store(bool pending)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(
+        SETUP_NVS_NAMESPACE,
+        NVS_READWRITE,
+        &handle
+    );
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_u8(handle, SETUP_NVS_PENDING_KEY, pending ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+bool setup_portal_should_resume(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(
+        SETUP_NVS_NAMESPACE,
+        NVS_READONLY,
+        &handle
+    );
+    if (err != ESP_OK) return false;
+
+    uint8_t value = 0;
+    err = nvs_get_u8(handle, SETUP_NVS_PENDING_KEY, &value);
+    nvs_close(handle);
+
+    return err == ESP_OK && value != 0;
+}
+
+static void state_set_locked(
+    setup_portal_state_t state,
+    const char *reason
+)
+{
+    s_state = state;
+    s_reason[0] = '\0';
+    if (reason != NULL) {
+        strlcpy(s_reason, reason, sizeof(s_reason));
+    }
+}
+
+static void state_set(setup_portal_state_t state, const char *reason)
+{
+    if (s_lock != NULL &&
+        xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        state_set_locked(state, reason);
+        xSemaphoreGive(s_lock);
+    }
+}
+
+static void wipe_pending_token_locked(void)
+{
+    secure_zero(s_pending_token, sizeof(s_pending_token));
+    s_claim_in_flight = false;
+    s_claim_attempts = 0;
+    s_next_claim_attempt_us = 0;
+}
+
+setup_portal_state_t setup_portal_state(void)
+{
+    setup_portal_state_t value = SETUP_IDLE;
+    if (s_lock != NULL &&
+        xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        value = s_state;
+        xSemaphoreGive(s_lock);
+    }
+    return value;
+}
+
+const char *setup_portal_state_name(setup_portal_state_t state)
+{
+    switch (state) {
+        case SETUP_CONNECTING: return "connecting";
+        case SETUP_WIFI_CONNECTED: return "wifi_connected";
+        case SETUP_CLAIMING: return "claiming";
+        case SETUP_SUCCESS: return "success";
+        case SETUP_FAILED: return "failed";
+        default: return "idle";
+    }
+}
+
+void setup_portal_reason(char *buffer, size_t capacity)
+{
+    if (buffer == NULL || capacity == 0) return;
+    buffer[0] = '\0';
+
+    if (s_lock != NULL &&
+        xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        strlcpy(buffer, s_reason, capacity);
+        xSemaphoreGive(s_lock);
+    }
+}
+
+bool setup_portal_is_active(void)
+{
+    return s_active;
+}
+
+static const char *friendly_message(
+    setup_portal_state_t state,
+    const char *reason
+)
+{
+    if (state == SETUP_CONNECTING)
+        return "Joining your Wi-Fi network…";
+    if (state == SETUP_WIFI_CONNECTED)
+        return "Wi-Fi is connected. Securing FloraCore services…";
+    if (state == SETUP_CLAIMING) {
+        if (reason != NULL && strcmp(reason, "backend_unreachable") == 0)
+            return "FloraCore connected to Wi-Fi, but couldn't reach FloraCore services. We'll retry.";
+        return "Linking this FloraCore to your account…";
+    }
+    if (state == SETUP_SUCCESS)
+        return "FloraCore connected. You can return to floraos.life.";
+    if (state != SETUP_FAILED)
+        return "Ready to set up your FloraCore.";
+
+    if (reason == NULL) reason = "";
+
+    if (strcmp(reason, "wifi_auth_failed") == 0)
+        return "FloraCore couldn't connect to this Wi-Fi network. Check the password and try again.";
+    if (strcmp(reason, "wifi_not_found") == 0)
+        return "That Wi-Fi network couldn't be found. Make sure it is nearby and uses 2.4 GHz.";
+    if (strcmp(reason, "wifi_timeout") == 0)
+        return "The Wi-Fi connection took too long. Check the network and try again.";
+    if (strcmp(reason, "no_internet") == 0)
+        return "FloraCore connected to Wi-Fi, but the internet isn't available.";
+    if (strcmp(reason, "storage_failed") == 0)
+        return "FloraCore connected, but couldn't safely save the Wi-Fi settings. Please try again.";
+    if (strcmp(reason, "claim_expired") == 0 ||
+        strcmp(reason, "invalid_claim_token") == 0)
+        return "This Connection Code is no longer valid. Generate a new one on floraos.life.";
+    if (strcmp(reason, "device_already_owned") == 0)
+        return "This FloraCore is already linked to another account.";
+    if (strcmp(reason, "backend_unreachable") == 0)
+        return "FloraCore is online, but couldn't reach FloraCore services. We'll retry.";
+    return "FloraCore couldn't verify the secure server response. Please try again.";
+}
+
+static esp_err_t send_json(httpd_req_t *req, const char *json)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, json);
+}
+
+static esp_err_t root_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, SETUP_PAGE, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t redirect_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", SETUP_CAPTIVE_URI);
+    return httpd_resp_send(req, NULL, 0);
+}
+
+static esp_err_t networks_handler(httpd_req_t *req)
+{
+    wifi_manager_scan_result_t results[WIFI_MANAGER_SCAN_MAX_RESULTS];
+    size_t count = 0;
+
+    esp_err_t err = wifi_manager_scan_visible(
+        results,
+        WIFI_MANAGER_SCAN_MAX_RESULTS,
+        &count
+    );
+
+    cJSON *root = cJSON_CreateObject();
+    cJ
