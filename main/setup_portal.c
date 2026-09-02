@@ -688,4 +688,52 @@ static void stop_dns_server(void)
     }
 
     for (int i = 0; i < 20 && s_dns_task != NULL; i++) {
-        vTaskDelay(pdMS_
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
+static void configure_dhcp_captive_url(void)
+{
+#ifdef CONFIG_ESP_ENABLE_DHCP_CAPTIVEPORTAL
+    esp_netif_t *ap =
+        esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+
+    if (ap == NULL) return;
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_stop(ap));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        esp_netif_dhcps_option(
+            ap,
+            ESP_NETIF_OP_SET,
+            ESP_NETIF_CAPTIVEPORTAL_URI,
+            (void *)SETUP_CAPTIVE_URI,
+            strlen(SETUP_CAPTIVE_URI)
+        )
+    );
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_start(ap));
+#else
+    ESP_LOGI(
+        TAG,
+        "DHCP captive portal option 114 not enabled; DNS redirect fallback is active"
+    );
+#endif
+}
+
+static const char *claim_error_reason(const char *error)
+{
+    if (error == NULL) return "server_verification_failed";
+    if (strcmp(error, "claim_expired") == 0) return "claim_expired";
+    if (strcmp(error, "invalid_claim_token") == 0) return "invalid_claim_token";
+    if (strcmp(error, "claim_cancelled") == 0) return "invalid_claim_token";
+    if (strcmp(error, "claim_already_used") == 0) return "invalid_claim_token";
+    if (strcmp(error, "device_already_owned") == 0) return "device_already_owned";
+    return "server_verification_failed";
+}
+
+static int64_t claim_retry_delay_us(unsigned attempts)
+{
+    unsigned shift = attempts > 5 ? 5 : attempts;
+    unsigned seconds = 1U << shift;
+
+    if (seconds > SETUP_CLAIM_RETRY_MAX_DELAY_SECONDS) {
+        seconds 
