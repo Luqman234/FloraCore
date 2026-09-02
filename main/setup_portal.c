@@ -945,3 +945,132 @@ static void setup_supervisor_task(void *parameter)
 
         vTaskDelay(pdMS_TO_TICKS(250));
     }
+}
+
+static esp_err_t ensure_runtime(void)
+{
+    if (s_lock == NULL) {
+        s_lock = xSemaphoreCreateMutex();
+        if (s_lock == NULL) return ESP_ERR_NO_MEM;
+    }
+
+    if (s_submission_queue == NULL) {
+        s_submission_queue =
+            xQueueCreate(2, sizeof(setup_submission_t *));
+        if (s_submission_queue == NULL) return ESP_ERR_NO_MEM;
+    }
+
+    if (s_worker_task == NULL) {
+        if (xTaskCreate(
+                setup_worker_task,
+                "flora_setup",
+                SETUP_WORKER_STACK,
+                NULL,
+                SETUP_TASK_PRIORITY,
+                &s_worker_task
+            ) != pdPASS) {
+            s_worker_task = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (s_supervisor_task == NULL) {
+        if (xTaskCreate(
+                setup_supervisor_task,
+                "flora_setup_sup",
+                SETUP_SUPERVISOR_STACK,
+                NULL,
+                SETUP_TASK_PRIORITY,
+                &s_supervisor_task
+            ) != pdPASS) {
+            s_supervisor_task = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t setup_portal_start(void)
+{
+    if (s_active) return ESP_OK;
+
+    esp_err_t err = ensure_runtime();
+    if (err != ESP_OK) return err;
+
+    uint8_t mac[6] = {0};
+    err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    if (err != ESP_OK) return err;
+
+    char ssid[WIFI_SSID_MAX_LEN] = {0};
+    snprintf(
+        ssid,
+        sizeof(ssid),
+        "FloraCore-%02X%02X%02X",
+        mac[3],
+        mac[4],
+        mac[5]
+    );
+
+#if FLORACORE_SETUP_AP_OPEN_DEV
+    const char *password = "";
+    ESP_LOGW(
+        TAG,
+        "DEVELOPMENT ONLY: setup SoftAP is open. Add a per-device printed/QR credential before production."
+    );
+#else
+#error "Production setup requires a per-device setup AP credential provisioned during manufacturing."
+#endif
+
+    err = wifi_manager_start_setup_ap(ssid, password);
+    if (err != ESP_OK) return err;
+
+    configure_dhcp_captive_url();
+
+    err = start_http_server();
+    if (err != ESP_OK) {
+        (void)wifi_manager_stop_setup_ap();
+        return err;
+    }
+
+    err = start_dns_server();
+    if (err != ESP_OK) {
+        stop_http_server();
+        (void)wifi_manager_stop_setup_ap();
+        return err;
+    }
+
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+        wipe_pending_token_locked();
+        state_set_locked(SETUP_IDLE, NULL);
+        s_success_at_us = 0;
+        xSemaphoreGive(s_lock);
+    }
+
+    s_active = true;
+
+    ESP_LOGI(TAG, "FloraCore consumer setup mode active");
+    ESP_LOGI(TAG, "Join Wi-Fi: %s", ssid);
+    ESP_LOGI(TAG, "Open: http://" SETUP_AP_IP "/");
+
+    return ESP_OK;
+}
+
+esp_err_t setup_portal_stop(void)
+{
+    stop_http_server();
+    stop_dns_server();
+
+    esp_err_t err = wifi_manager_stop_setup_ap();
+    s_active = false;
+
+    if (s_lock != NULL &&
+        xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+        wipe_pending_token_locked();
+        state_set_locked(SETUP_IDLE, NULL);
+        s_success_at_us = 0;
+        xSemaphoreGive(s_lock);
+    }
+
+    return err;
+}
