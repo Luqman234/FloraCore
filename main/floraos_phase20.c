@@ -1021,4 +1021,223 @@ static void add_diagnostics(cJSON *root, bool command_protocol_enabled)
         (double)esp_get_minimum_free_heap_size()
     );
 
-    size_t psram_free = heap_caps_get_free_size(MAL
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (psram_free > 0) {
+        cJSON_AddNumberToObject(
+            diagnostics,
+            "psram_free_bytes",
+            (double)psram_free
+        );
+    }
+
+    cJSON_AddStringToObject(
+        diagnostics,
+        "reset_reason",
+        reset_reason_name(esp_reset_reason())
+    );
+
+    const esp_app_desc_t *app = esp_app_get_description();
+    if (app != NULL) {
+        if (app->project_name[0] != '\0') {
+            cJSON_AddStringToObject(diagnostics, "project_name", app->project_name);
+        }
+        if (app->version[0] != '\0') {
+            cJSON_AddStringToObject(diagnostics, "firmware_version", app->version);
+        }
+    }
+
+    cJSON_AddStringToObject(
+        diagnostics,
+        "hardware_revision",
+        PHASE20_HARDWARE_REVISION
+    );
+
+    if (command_protocol_enabled) {
+        cJSON_AddNumberToObject(
+            diagnostics,
+            "command_protocol",
+            PHASE20_COMMAND_PROTOCOL
+        );
+    }
+
+    if (s_initialized && water_lockout_now()) {
+        cJSON_AddItemToArray(
+            faults,
+            cJSON_CreateString("local_safety_lockout")
+        );
+    }
+
+    cJSON_AddItemToObject(diagnostics, "faults", faults);
+    cJSON_AddItemToObject(root, "diagnostics", diagnostics);
+}
+
+static void add_capabilities(cJSON *root)
+{
+    cJSON *capabilities = cJSON_CreateObject();
+    cJSON *sensors = cJSON_CreateObject();
+    cJSON *actuators = cJSON_CreateObject();
+    cJSON *commands = cJSON_CreateObject();
+
+    if (
+        capabilities == NULL ||
+        sensors == NULL ||
+        actuators == NULL ||
+        commands == NULL
+    ) {
+        cJSON_Delete(capabilities);
+        cJSON_Delete(sensors);
+        cJSON_Delete(actuators);
+        cJSON_Delete(commands);
+        return;
+    }
+
+    cJSON_AddNumberToObject(capabilities, "schema", PHASE20_CAPABILITY_SCHEMA);
+
+    cJSON_AddBoolToObject(sensors, "soil", true);
+    cJSON_AddBoolToObject(sensors, "light", true);
+    cJSON_AddBoolToObject(sensors, "temperature", false);
+    cJSON_AddBoolToObject(sensors, "humidity", false);
+    cJSON_AddBoolToObject(sensors, "water_level", false);
+    cJSON_AddBoolToObject(sensors, "fertilizer_level", false);
+    cJSON_AddBoolToObject(sensors, "leak", false);
+
+    cJSON_AddBoolToObject(actuators, "water_pump", true);
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+    cJSON_AddBoolToObject(actuators, "grow_light", true);
+#else
+    cJSON_AddBoolToObject(actuators, "grow_light", false);
+#endif
+    cJSON_AddBoolToObject(actuators, "fertilizer_pump", false);
+
+    cJSON_AddNumberToObject(commands, "water", 1);
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+    cJSON_AddNumberToObject(commands, "grow_light", 1);
+#else
+    cJSON_AddNumberToObject(commands, "grow_light", 0);
+#endif
+    cJSON_AddNumberToObject(commands, "fertilize", 0);
+
+    cJSON_AddItemToObject(capabilities, "sensors", sensors);
+    cJSON_AddItemToObject(capabilities, "actuators", actuators);
+    cJSON_AddItemToObject(capabilities, "commands", commands);
+    cJSON_AddItemToObject(root, "capabilities", capabilities);
+}
+
+char *floraos_phase20_build_heartbeat(
+    const char *mode,
+    bool allow_commands
+)
+{
+    if (mode == NULL) return NULL;
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) return NULL;
+
+    bool command_protocol_enabled = allow_commands && s_initialized;
+
+    cJSON_AddStringToObject(root, "mode", mode);
+
+    if (command_protocol_enabled) {
+        cJSON_AddNumberToObject(
+            root,
+            "command_protocol",
+            PHASE20_COMMAND_PROTOCOL
+        );
+        add_capabilities(root);
+    }
+
+    add_diagnostics(root, command_protocol_enabled);
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return payload;
+}
+
+char *floraos_phase20_build_telemetry(
+    const char *mode,
+    const floraos_phase20_telemetry_t *sample,
+    bool allow_commands
+)
+{
+    if (mode == NULL || sample == NULL) return NULL;
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) return NULL;
+
+    cJSON_AddStringToObject(root, "mode", mode);
+
+    if (allow_commands && s_initialized) {
+        cJSON_AddNumberToObject(
+            root,
+            "command_protocol",
+            PHASE20_COMMAND_PROTOCOL
+        );
+    }
+
+    if (sample->soil_adc_valid) {
+        cJSON_AddNumberToObject(root, "soil_adc", sample->soil_adc);
+    }
+
+    if (sample->soil_percent_valid) {
+        cJSON_AddNumberToObject(root, "soil_percent", sample->soil_percent);
+    }
+
+    cJSON_AddBoolToObject(root, "light_valid", sample->light_valid);
+    if (sample->light_valid) {
+        cJSON_AddNumberToObject(root, "light_lux", sample->light_lux);
+    }
+
+    cJSON_AddBoolToObject(root, "pump_on", sample->pump_on);
+
+    if (sample->grow_light_valid) {
+        cJSON_AddBoolToObject(root, "grow_light_on", sample->grow_light_on);
+    }
+
+    cJSON_AddBoolToObject(root, "rtc_valid", sample->rtc_valid);
+    if (sample->rtc_valid && sample->rtc_text[0] != '\0') {
+        cJSON_AddStringToObject(root, "rtc", sample->rtc_text);
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return payload;
+}
+
+void floraos_phase20_free_payload(char *payload)
+{
+    free(payload);
+}
+
+esp_err_t floraos_phase20_queue_message(
+    const char *type,
+    const char *payload_json,
+    bool accept_commands
+)
+{
+    if (type == NULL || payload_json == NULL) return ESP_ERR_INVALID_ARG;
+
+    if (accept_commands && s_initialized) {
+        return floraos_client_queue_message_with_callback(
+            type,
+            payload_json,
+            response_callback,
+            NULL
+        );
+    }
+
+    return floraos_client_queue_message(type, payload_json);
+}
+
+void floraos_phase20_set_water_lockout(bool locked)
+{
+    if (!s_initialized || s_lock == NULL) return;
+
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        s_water_lockout = locked;
+        xSemaphoreGive(s_lock);
+    }
+}
+
+bool floraos_phase20_water_command_active(void)
+{
+    if (!s_initialized || s_lock == 
