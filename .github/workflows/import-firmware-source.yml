@@ -1,0 +1,42 @@
+name: Import FloraCore firmware source snapshot
+
+on:
+  push:
+    branches:
+      - firmware
+    paths:
+      - ".upload/READY"
+
+permissions:
+  contents: write
+
+jobs:
+  import-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out firmware branch
+        uses: actions/checkout@v4
+        with:
+          ref: firmware
+          fetch-depth: 0
+
+      - name: Reconstruct and import audited source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat .upload/source.b64.part* | base64 --decode > /tmp/floracore-source.tar.gz
+          mkdir -p /tmp/floracore-source
+          tar -xzf /tmp/floracore-source.tar.gz -C /tmp/floracore-source
+
+          cp -a /tmp/floracore-source/. .
+
+          rm -rf .upload
+          rm -f .github/workflows/import-firmware-source.yml
+
+          git config user.name "FloraCore source importer"
+          git config user.email "actions@users.noreply.github.com"
+
+          git add -A
+          git commit -m "Import current FloraCore firmware source v1.0.3"
+          git push origin HEAD:firmware
