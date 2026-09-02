@@ -465,4 +465,123 @@ esp_err_t floraos_client_send_message(
 
     esp_http_client_config_t config = {
         .url = FLORAOS_ENDPOINT,
- 
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 12000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = http_event_handler,
+        .user_data = response,
+    };
+
+    client = esp_http_client_init(&config);
+    if (client == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        esp_http_client_set_header(client, "Content-Type", "application/json")
+    );
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        esp_http_client_set_header(client, "User-Agent", "FloraCore-ESP32S3/1")
+    );
+    esp_http_client_set_post_field(client, body, body_len);
+
+    err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        goto cleanup;
+    }
+
+    int status_code = esp_http_client_get_status_code(client);
+    if (status_code < 200 || status_code >= 300 || response->overflowed) {
+        ESP_LOGW(TAG, "FloraOS HTTP status=%d", status_code);
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    if (!json_get_string(
+            response->data,
+            "nonce",
+            response_nonce_hex,
+            FLORAOS_NONCE_LEN * 2 + 1
+        ) ||
+        !json_get_string(
+            response->data,
+            "ciphertext",
+            response_ciphertext_hex,
+            MAX_HTTP_RESPONSE
+        )) {
+        err = ESP_ERR_INVALID_RESPONSE;
+        goto cleanup;
+    }
+
+    uint8_t response_nonce[FLORAOS_NONCE_LEN];
+    size_t response_nonce_len = 0;
+    err = floraos_hex_decode(
+        response_nonce_hex,
+        response_nonce,
+        sizeof(response_nonce),
+        &response_nonce_len
+    );
+    if (err != ESP_OK || response_nonce_len != FLORAOS_NONCE_LEN) {
+        err = ESP_ERR_INVALID_RESPONSE;
+        goto cleanup;
+    }
+
+    size_t response_ciphertext_len = 0;
+    err = floraos_hex_decode(
+        response_ciphertext_hex,
+        response_ciphertext,
+        MAX_HTTP_RESPONSE / 2,
+        &response_ciphertext_len
+    );
+    if (err != ESP_OK) goto cleanup;
+
+    char response_aad[192];
+    err = make_aad("s2d", response_aad, sizeof(response_aad));
+    if (err != ESP_OK) goto cleanup;
+
+    size_t decrypted_len = 0;
+    err = floraos_crypto_decrypt_s2d(
+        response_nonce,
+        (const uint8_t *)response_aad,
+        strlen(response_aad),
+        response_ciphertext,
+        response_ciphertext_len,
+        decrypted,
+        (MAX_HTTP_RESPONSE / 2) - 1,
+        &decrypted_len
+    );
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "response authentication failed");
+        goto cleanup;
+    }
+
+    decrypted[decrypted_len] = '\0';
+    ESP_LOGI(TAG, "Authenticated FloraOS response received");
+
+    if (response_plaintext != NULL && response_capacity > 0) {
+        size_t copy_len =
+            decrypted_len < response_capacity - 1
+            ? decrypted_len
+            : response_capacity - 1;
+        memcpy(response_plaintext, decrypted, copy_len);
+        response_plaintext[copy_len] = '\0';
+    }
+
+cleanup:
+    if (client != NULL) {
+        esp_http_client_cleanup(client);
+    }
+
+    secure_free(plaintext, MAX_PLAINTEXT);
+    secure_free(ciphertext, MAX_CIPHERTEXT);
+    secure_free(ciphertext_hex, MAX_CIPHERTEXT * 2 + 1);
+    secure_free(body, MAX_OUTER_JSON);
+    secure_free(response, sizeof(*response));
+    secure_free(response_nonce_hex, FLORAOS_NONCE_LEN * 2 + 1);
+    secure_free(response_ciphertext_hex, MAX_HTTP_RESPONSE);
+    secure_free(response_ciphertext, MAX_HTTP_RESPONSE / 2);
+    secure_free(decrypted, MAX_HTTP_RESPONSE / 2);
+
+    return err;
+}
