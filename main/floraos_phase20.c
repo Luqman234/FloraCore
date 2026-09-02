@@ -1240,4 +1240,33 @@ void floraos_phase20_set_water_lockout(bool locked)
 
 bool floraos_phase20_water_command_active(void)
 {
-    if (!s_initialized || s_lock == 
+    if (!s_initialized || s_lock == NULL) return false;
+
+    bool active = false;
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        active =
+            s_active_command_id[0] != '\0' &&
+            s_active_action == ACTION_WATER;
+        xSemaphoreGive(s_lock);
+    }
+
+    return active;
+}
+
+void floraos_phase20_force_safe_outputs(void)
+{
+    if (!s_initialized) return;
+
+    if (s_ops.water_set != NULL) {
+        (void)s_ops.water_set(false);
+    }
+
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+    if (s_grow_light_timer != NULL) {
+        (void)esp_timer_stop(s_grow_light_timer);
+    }
+    if (s_ops.grow_light_set != NULL) {
+        (void)s_ops.grow_light_set(false);
+    }
+#endif
+}
