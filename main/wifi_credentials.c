@@ -132,4 +132,114 @@ esp_err_t wifi_credentials_save(const char *ssid, const char *password)
     uint8_t stored_count = 0;
     err = nvs_get_u8(handle, NVS_COUNT_KEY, &stored_count);
 
-    if (err == ESP_ERR_NVS
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        stored_count = 0;
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read credential count: %s", esp_err_to_name(err));
+        nvs_close(handle);
+        return err;
+    }
+
+    if (stored_count > MAX_WIFI_NETWORKS) {
+        stored_count = MAX_WIFI_NETWORKS;
+    }
+
+    int target_index = -1;
+
+    for (size_t i = 0; i < stored_count; i++) {
+        char ssid_key[16];
+        make_ssid_key(i, ssid_key, sizeof(ssid_key));
+
+        char stored_ssid[WIFI_SSID_MAX_LEN] = {0};
+        size_t stored_ssid_length = sizeof(stored_ssid);
+
+        esp_err_t read_err = nvs_get_str(handle, ssid_key, stored_ssid, &stored_ssid_length);
+
+        if (read_err == ESP_OK && strcmp(stored_ssid, ssid) == 0) {
+            target_index = (int)i;
+            break;
+        }
+    }
+
+    if (target_index < 0) {
+        if (stored_count >= MAX_WIFI_NETWORKS) {
+            ESP_LOGE(TAG, "Maximum of %d saved Wi-Fi networks reached", MAX_WIFI_NETWORKS);
+            nvs_close(handle);
+            return ESP_ERR_NO_MEM;
+        }
+
+        target_index = stored_count;
+        stored_count++;
+    }
+
+    char ssid_key[16];
+    char password_key[16];
+    make_ssid_key((size_t)target_index, ssid_key, sizeof(ssid_key));
+    make_password_key((size_t)target_index, password_key, sizeof(password_key));
+
+    err = nvs_set_str(handle, ssid_key, ssid);
+    if (err != ESP_OK) {
+        nvs_close(handle);
+        return err;
+    }
+
+    err = nvs_set_str(handle, password_key, password);
+    if (err != ESP_OK) {
+        nvs_close(handle);
+        return err;
+    }
+
+    err = nvs_set_u8(handle, NVS_COUNT_KEY, stored_count);
+    if (err != ESP_OK) {
+        nvs_close(handle);
+        return err;
+    }
+
+    err = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit Wi-Fi credential: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Saved Wi-Fi credential for SSID: %s", ssid);
+    wifi_credentials_load();
+
+    return ESP_OK;
+}
+
+esp_err_t wifi_credentials_erase_all(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        memset(known_networks, 0, sizeof(known_networks));
+        known_network_count = 0;
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_erase_all(handle);
+
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to erase Wi-Fi credentials: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    memset(known_networks, 0, sizeof(known_networks));
+    known_network_count = 0;
+
+    ESP_LOGI(TAG, "All saved Wi-Fi credentials erased");
+    return ESP_OK;
+}
