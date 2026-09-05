@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07111F" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
+  <title>Dashboard — FloraCore</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}?v=20260901-ota2" />
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='icons/favicon.svg') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/favicon-32x32.png') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="64x64" href="{{ url_for('static', filename='icons/favicon-64x64.png') }}?v=20260901">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='icons/favicon.ico') }}?v=20260901">
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='icons/apple-touch-icon.png') }}?v=20260901">
+</head>
+<body data-onboarding-state="{{ onboarding_state or 'legacy' }}" data-connect-only="{{ 'true' if connect_only else 'false' }}">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="FloraCore home">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span>FloraCore</span>
+    </a>
+    <div class="topbar-meta">
+      <span class="live"><i></i>CORE ONLINE</span>
+      <span class="user-id-badge" title="Your permanent FloraCore User ID">USER ID {{ user_id }}</span>
+      <span id="sessionLabel">{{ user_email }}</span>
+      <button id="logoutButton" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main class="dashboard-shell{% if connect_only %} is-connect-only{% endif %}" id="dashboardShell">
+    <aside class="sidebar" aria-label="Dashboard navigation" id="dashboardSidebar">
+      {% if connect_only %}
+        <span class="side-label">ONBOARDING</span>
+        <a class="active connect-link" href="/connect"><span aria-hidden="true">↗</span>Connect</a>
+        <a href="/notifications">Notifications</a>
+        <a href="/automations/v2">Automation v2</a>
+        <a href="/settings">Settings</a>
+      {% else %}
+        <span class="side-label">WORKSPACE</span>
+        <a class="active" href="#overview">Overview</a>
+        <a href="#device">Device</a>
+        <a href="#firmware">Firmware</a>
+        <span class="side-label second">SYSTEM</span>
+        <a href="#telemetry">Telemetry</a>
+        <a href="#activity">Activity</a>
+        <a href="/plants">Plants</a>
+        <a href="/automations">Automations</a>
+        <a href="/settings">Settings</a>
+        <span class="side-label second">DEVELOPER</span>
+        <a href="/settings/developer">Developer API</a>
+        <a href="/docs">Documentation</a>
+        <span class="side-label second">LINK</span>
+        <a class="connect-link" href="/connect"><span aria-hidden="true">↗</span>Connect</a>
+      {% endif %}
+    </aside>
+
+    {% if connect_only %}
+      <section class="workspace connect-workspace" id="overview">
+        <div class="workspace-head">
+          <div>
+            <span class="eyebrow">FLORACORE / DEVICE OWNERSHIP</span>
+            <h1>Connect your first system.</h1>
+            <p>Your account is ready. Workspace and System unlock only after an authenticated FloraOS device is claimed by this account.</p>
+          </div>
+          <div class="sync-box onboarding-state-box">
+            <span>OWNERSHIP</span>
+            <strong>0 devices</strong>
+          </div>
+        </div>
+
+        <section class="connect-empty-state" aria-labelledby="connect-empty-title">
+          <div class="connect-visual" aria-hidden="true">
+            <div class="connect-node node-core"><span></span><b>ACCOUNT</b></div>
+            <div class="connect-line"><i></i></div>
+            <div class="connect-node node-device"><span></span><b>FLORAOS</b></div>
+          </div>
+          <div class="connect-copy">
+            <span class="connect-kicker">NO OWNED HARDWARE</span>
+            <h2 id="connect-empty-title">Your workspace activates after a secure device claim.</h2>
+            <p>The browser never receives the ESP32 encryption keys. FloraOS proves the hardware identity over the existing AES-GCM channel, then a short-lived claim token binds that authenticated device to your account.</p>
+            <a class="primary-connect-button" href="/connect">Connect FloraCore <span aria-hidden="true">→</span></a>
+          </div>
+        </section>
+      </section>
+    {% else %}
+      <section class="workspace" id="overview">
+        <div class="workspace-head">
+          <div>
+            <span class="eyebrow">FLORACORE / OWNED SYSTEMS</span>
+            <h1>System overview</h1>
+            <p>Live values below are read from your authenticated FloraOS devices. Missing fields remain unavailable rather than simulated.</p>
+          </div>
+          <div class="sync-box"><span>LAST SYNC</span><strong id="lastSyncValue">—</strong></div>
+        </div>
+
+        <div class="kpi-grid" aria-label="Workspace summary">
+          <article><span>Owned devices</span><strong id="ownedCount">{{ owned_devices|length }}</strong><small>account scoped</small></article>
+          <article><span>Online</span><strong id="onlineCount">—</strong><small>heartbeat ≤ 120s</small></article>
+          <article><span>Latest message</span><strong class="compact-kpi" id="latestMessageType">—</strong><small>authenticated E2EE</small></article>
+          <article><span>Telemetry</span><strong class="compact-kpi" id="telemetryState">—</strong><small>latest stored sample</small></article>
+        </div>
+
+        <div class="dashboard-grid">
+          <section class="panel device-selector-panel" id="device">
+            <div class="panel-head"><div><span>OWNERSHIP</span><h2>Your FloraCore devices</h2></div><b class="online"><i></i>SECURED</b></div>
+            <div class="owned-device-list" id="ownedDeviceList" aria-live="polite">
+              {% for device in owned_devices %}
+                <button type="button" class="owned-device-item{% if loop.first %} active{% endif %}" data-device-id="{{ device.device_id }}">
+                  <span><b>{{ device.nickname or device.device_id }}</b><small>{{ device.device_id }}</small></span>
+                  <em>{% if device.last_seen %}linked{% else %}awaiting data{% endif %}</em>
+                </button>
+              {% endfor %}
+            </div>
+          </section>
+
+          <section class="panel large" id="telemetry">
+            <div class="panel-head">
+              <div><span id="selectedDeviceId">DEVICE</span><h2 id="selectedDeviceName">Live telemetry</h2></div>
+              <b class="device-online-state" id="deviceOnlineState"><i></i>CHECKING</b>
+            </div>
+            <div class="sensor-grid real-telemetry-grid">
+              <div><span>Soil moisture</span><strong id="soilPercent">—</strong><small id="soilAdc">ADC —</small></div>
+              <div><span>Light</span><strong id="lightLux">—</strong><small id="lightValidity">sensor —</small></div>
+              <div><span>Water pump</span><strong id="pumpState">—</strong><small>reported state</small></div>
+              <div><span>Device RTC</span><strong class="sensor-text" id="rtcValue">—</strong><small id="rtcValidity">clock —</small></div>
+            </div>
+            <div class="telemetry-meta">
+              <div><span>RECEIVED</span><strong id="telemetryReceived">—</strong></div>
+              <div><span>MESSAGE ID</span><strong id="telemetryMessageId">—</strong></div>
+            </div>
+          </section>
+
+          <section class="panel" id="activity">
+            <div class="panel-head"><div><span>DEVICE STATE</span><h2>Authenticated activity</h2></div></div>
+            <dl class="state-list">
+              <div><dt>Last seen</dt><dd id="stateLastSeen">—</dd></div>
+              <div><dt>Last message</dt><dd id="stateMessageType">—</dd></div>
+              <div><dt>Message ID</dt><dd id="stateMessageId">—</dd></div>
+              <div><dt>Claimed</dt><dd id="stateClaimedAt">—</dd></div>
+            </dl>
+          </section>
+
+          <section class="panel firmware-panel" id="firmware">
+            <div class="panel-head">
+              <div><span>DEVICE / OTA</span><h2>Firmware</h2></div>
+              <b class="firmware-status" id="firmwareStatus">CHECKING</b>
+            </div>
+
+            <dl class="firmware-grid">
+              <div><dt>Installed</dt><dd id="firmwareInstalled">—</dd></div>
+              <div><dt>Available</dt><dd id="firmwareAvailable">—</dd></div>
+              <div><dt>Channel</dt><dd id="firmwareChannel">—</dd></div>
+              <div><dt>Last update</dt><dd id="firmwareLastUpdate">—</dd></div>
+            </dl>
+
+            <div class="firmware-release-meta" id="firmwareReleaseMeta" hidden>
+              <span>APPROVED RELEASE</span>
+              <strong id="firmwareReleaseVersion">—</strong>
+              <small id="firmwareReleaseHash">SHA-256 —</small>
+            </div>
+
+            <div class="firmware-history">
+              <span>RECENT OTA ACTIVITY</span>
+              <div id="firmwareHistory">
+                <p class="firmware-empty">No OTA history yet.</p>
+              </div>
+            </div>
+
+            <p class="firmware-note">
+              FloraOS selects approved releases server-side. This dashboard does not accept arbitrary firmware URLs.
+            </p>
+          </section>
+
+          <section class="panel platform-note-panel">
+            <div class="panel-head"><div><span>SYSTEM / ADVANCED</span><h2>Automation Studio</h2></div></div>
+            <p>Build validated sensor, schedule, cooldown, watering, and grow-light flows. Automation actions use the same bounded command queue and encrypted device channel as FloraOS API v1.2.</p>
+            <a class="automation-studio-link" href="/automations">Open Automation Studio <span aria-hidden="true">→</span></a>
+          </section>
+        </div>
+      </section>
+    {% endif %}
+  </main>
+
+  {% if show_connect_prompt %}
+    <div class="modal-backdrop is-open" id="connectPromptModal" role="presentation">
+      <section class="modal-card connect-prompt-card" role="dialog" aria-modal="true" aria-labelledby="connectPromptTitle" aria-describedby="connectPromptDescription">
+        <div class="modal-signal" aria-hidden="true"><span></span><i></i><b></b></div>
+        <span class="modal-kicker">FIRST SYSTEM / SETUP</span>
+        <h2 id="connectPromptTitle">Ready to Connect Your FloraCore to The Internet?</h2>
+        <p id="connectPromptDescription">Generate a temporary connection code and let your already-authenticated FloraOS device securely claim this account.</p>
+        <div class="modal-actions">
+          <button class="modal-primary" id="connectYesButton" type="button">Yes <span aria-hidden="true">→</span></button>
+          <button class="modal-secondary" id="connectLaterButton" type="button">Later</button>
+        </div>
+        <p class="modal-error" id="connectPromptError" aria-live="polite"></p>
+      </section>
+    </div>
+  {% endif %}
+
+  <script src="{{ url_for('static', filename='js/dashboard.js') }}?v=20260901-ota2" defer></script>
+</body>
+</html>

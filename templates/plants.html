@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07111F" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
+  <title>Plants — FloraCore</title>
+
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='icons/favicon.svg') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/favicon-32x32.png') }}?v=20260901">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='icons/favicon.ico') }}?v=20260901">
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}?v=20260901-plants1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/plants.css') }}?v=20260901-plants1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/plants_phase20.css') }}?v=20260902-p20" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="FloraCore home">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span>FloraCore</span>
+    </a>
+
+    <div class="topbar-meta">
+      <span class="plants-engine-badge"><i></i>CARE ENGINE</span>
+      <span>USER ID {{ user_id }}</span>
+      <span>{{ user_email }}</span>
+      <a class="plants-top-button" href="/dashboard">Dashboard</a>
+    </div>
+  </header>
+
+  <main class="dashboard-shell plants-shell{% if connect_only %} is-connect-only{% endif %}">
+    <aside class="sidebar plants-sidebar" aria-label="FloraOS navigation">
+      {% if connect_only %}
+        <span class="side-label">ONBOARDING</span>
+        <a class="connect-link" href="/connect"><span aria-hidden="true">↗</span>Connect</a>
+        <a class="active" href="/plants">Plants</a>
+        <a href="/notifications">Notifications</a>
+        <a href="/automations/v2">Automation v2</a>
+        <a href="/settings">Settings</a>
+
+        <span class="side-label second">HELP</span>
+        <a href="/docs">Documentation</a>
+      {% else %}
+        <span class="side-label">WORKSPACE</span>
+        <a href="/dashboard">Overview</a>
+        <a class="active" href="/plants">Plants</a>
+        <a href="/automations">Automations</a>
+        <a href="/settings">Settings</a>
+
+        <span class="side-label second">DEVELOPER</span>
+        <a href="/settings/developer">Developer API</a>
+        <a href="/docs">Documentation</a>
+
+        <span class="side-label second">LINK</span>
+        <a class="connect-link" href="/connect"><span aria-hidden="true">↗</span>Connect</a>
+      {% endif %}
+    </aside>
+
+    <section class="workspace plants-workspace">
+      <div class="workspace-head plants-head">
+        <div>
+          <span class="eyebrow">FLORACORE / PLANT INTELLIGENCE</span>
+          <h1>Plant profiles</h1>
+          <p>Turn raw sensor readings into plant-specific care context. Presets are editable starting points, and the care score measures target matching rather than diagnosing plant health.</p>
+        </div>
+        <button class="plants-refresh-button" id="refreshCareButton" type="button">Refresh care</button>
+      </div>
+
+      {% if connect_only %}
+      <section class="plants-empty-connect">
+        <div class="empty-orbit" aria-hidden="true">
+          <span class="orbit-core"></span>
+          <i></i>
+          <b></b>
+        </div>
+        <div>
+          <span class="plant-kicker">NO OWNED FLORACORE</span>
+          <h2>Connect hardware before creating a plant profile.</h2>
+          <p>Profiles are always scoped to a device you own. FloraCore never accepts a browser-supplied device ID as ownership authority.</p>
+          <a href="/connect">Connect FloraCore <span aria-hidden="true">→</span></a>
+        </div>
+      </section>
+      {% else %}
+
+      <div class="plants-toolbar">
+        <label class="plant-device-picker">
+          <span>FLORACORE</span>
+          <select id="plantDeviceSelect"></select>
+        </label>
+
+        <div class="plant-profile-summary">
+          <span id="profileSpeciesLabel">NO PROFILE</span>
+          <b id="profilePlantName">Configure this FloraCore</b>
+          <small id="profileStageLabel">—</small>
+        </div>
+
+        <button class="profile-edit-button" id="editProfileButton" type="button">Edit profile</button>
+      </div>
+
+      <section class="plant-profile-setup" id="profileSetup" hidden>
+        <div class="profile-setup-head">
+          <div>
+            <span class="plant-kicker">PROFILE CONFIGURATION</span>
+            <h2 id="profileSetupTitle">Create plant profile</h2>
+            <p>Choose a preset, then tune the thresholds to your actual sensor calibration and growing medium.</p>
+          </div>
+          <button class="profile-close-button" id="closeProfileButton" type="button" aria-label="Close profile editor">×</button>
+        </div>
+
+        <div class="profile-form-grid">
+          <label class="plant-field wide">
+            <span>PLANT NAME</span>
+            <input id="plantNameInput" maxlength="64" placeholder="e.g. Kitchen Peppermint" />
+          </label>
+
+          <label class="plant-field">
+            <span>SPECIES PRESET</span>
+            <select id="speciesSelect"></select>
+          </label>
+
+          <label class="plant-field">
+            <span>GROWTH STAGE</span>
+            <select id="growthStageSelect"></select>
+          </label>
+        </div>
+
+        <div class="profile-preset-strip">
+          <div>
+            <b id="presetName">Preset</b>
+            <p id="presetDescription">Choose a species preset.</p>
+          </div>
+          <button class="profile-secondary-button" id="applyPresetButton" type="button">Use preset defaults</button>
+        </div>
+
+        <div class="target-grid">
+          <article class="target-card">
+            <span>SOIL MOISTURE</span>
+            <div class="range-inputs">
+              <label><small>MIN</small><input id="soilMinInput" type="number" min="0" max="100" step="1" /></label>
+              <i>→</i>
+              <label><small>MAX</small><input id="soilMaxInput" type="number" min="0" max="100" step="1" /></label>
+              <em>%</em>
+            </div>
+          </article>
+
+          <article class="target-card">
+            <span>LIGHT</span>
+            <div class="range-inputs">
+              <label><small>MIN</small><input id="lightMinInput" type="number" min="0" max="200000" step="100" /></label>
+              <i>→</i>
+              <label><small>MAX</small><input id="lightMaxInput" type="number" min="0" max="200000" step="100" /></label>
+              <em>lux</em>
+            </div>
+          </article>
+
+          <article class="target-card">
+            <span>TEMPERATURE</span>
+            <div class="range-inputs">
+              <label><small>MIN</small><input id="temperatureMinInput" type="number" min="-10" max="60" step="0.5" /></label>
+              <i>→</i>
+              <label><small>MAX</small><input id="temperatureMaxInput" type="number" min="-10" max="60" step="0.5" /></label>
+              <em>°C</em>
+            </div>
+          </article>
+
+          <article class="target-card">
+            <span>HUMIDITY</span>
+            <div class="range-inputs">
+              <label><small>MIN</small><input id="humidityMinInput" type="number" min="0" max="100" step="1" /></label>
+              <i>→</i>
+              <label><small>MAX</small><input id="humidityMaxInput" type="number" min="0" max="100" step="1" /></label>
+              <em>%</em>
+            </div>
+          </article>
+
+          <article class="target-card supply-threshold-card">
+            <span>WATER RESERVOIR WARNING</span>
+            <div class="single-threshold">
+              <small>WARN BELOW</small>
+              <input id="reservoirLowInput" type="number" min="0" max="100" step="1" />
+              <em>%</em>
+            </div>
+          </article>
+
+          <article class="target-card supply-threshold-card">
+            <span>FERTILIZER WARNING</span>
+            <div class="single-threshold">
+              <small>WARN BELOW</small>
+              <input id="fertilizerLowInput" type="number" min="0" max="100" step="1" />
+              <em>%</em>
+            </div>
+          </article>
+        </div>
+
+        <div class="profile-actions">
+          <p id="profileEditorMessage" role="status" aria-live="polite"></p>
+          <div>
+            <button class="profile-danger-button" id="deleteProfileButton" type="button" hidden>Remove profile</button>
+            <button class="profile-save-button" id="saveProfileButton" type="button">Save profile</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="care-empty-profile" id="careEmptyProfile" hidden>
+        <div class="empty-profile-symbol" aria-hidden="true">+</div>
+        <div>
+          <span class="plant-kicker">PROFILE REQUIRED</span>
+          <h2>Tell FloraCore what is growing here.</h2>
+          <p>Choose a species preset or create custom thresholds. No care score is generated until a profile exists.</p>
+          <button id="createProfileButton" type="button">Create plant profile</button>
+        </div>
+      </section>
+
+      <div class="care-dashboard" id="careDashboard" hidden>
+        <section class="care-overview-panel">
+          <div class="care-score-block">
+            <div class="care-score-ring" id="careScoreRing" style="--score:0">
+              <div>
+                <strong id="careScoreValue">—</strong>
+                <span>/ 100</span>
+              </div>
+            </div>
+            <div class="care-score-copy">
+              <span>CARE SCORE</span>
+              <h2 id="careHeadline">Waiting for telemetry</h2>
+              <p id="careDisclaimer">Care score measures target matching, not plant disease or biological health.</p>
+              <div class="care-confidence">
+                <span>DATA COVERAGE</span>
+                <b id="careConfidence">0%</b>
+              </div>
+            </div>
+          </div>
+
+          <div class="care-device-state">
+            <span class="care-device-status" id="careDeviceStatus"><i></i>CHECKING</span>
+            <dl>
+              <div><dt>Telemetry age</dt><dd id="telemetryAgeValue">—</dd></div>
+              <div><dt>Heartbeat</dt><dd id="heartbeatAgeValue">—</dd></div>
+              <div><dt>Last evaluated</dt><dd id="careEvaluatedValue">—</dd></div>
+            </dl>
+          </div>
+        </section>
+
+        <section class="condition-panel">
+          <div class="plant-panel-head">
+            <div>
+              <span>LIVE CONDITIONS</span>
+              <h2>Target matching</h2>
+            </div>
+            <small>Missing sensors stay unknown</small>
+          </div>
+          <div class="condition-grid" id="conditionGrid"></div>
+        </section>
+
+        <section class="supplies-panel">
+          <div class="plant-panel-head">
+            <div>
+              <span>SERVICE MODULE</span>
+              <h2>Reservoir readiness</h2>
+            </div>
+          </div>
+          <div class="supply-grid" id="supplyGrid"></div>
+        </section>
+
+        <section class="insights-panel">
+          <div class="plant-panel-head">
+            <div>
+              <span>CARE INTELLIGENCE</span>
+              <h2>What needs attention</h2>
+            </div>
+            <small id="insightCount">0 insights</small>
+          </div>
+          <div class="insight-list" id="insightList"></div>
+        </section>
+
+        <section class="targets-panel">
+          <div class="plant-panel-head">
+            <div>
+              <span>PROFILE TARGETS</span>
+              <h2 id="targetProfileName">Configured care ranges</h2>
+            </div>
+            <button class="profile-secondary-button" id="editTargetsButton" type="button">Tune targets</button>
+          </div>
+          <div class="target-summary-grid" id="targetSummaryGrid"></div>
+          <p class="target-notice" id="catalogNotice"></p>
+        </section>
+      </div>
+      {% endif %}
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='js/plants.js') }}?v=20260901-plants1" defer></script>
+  <script src="{{ url_for('static', filename='js/plants_phase20.js') }}?v=20260902-p20" defer></script>
+</body>
+</html>

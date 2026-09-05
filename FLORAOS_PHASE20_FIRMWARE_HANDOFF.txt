@@ -1,0 +1,293 @@
+FLORACORE WEB -> FLORAOS FIRMWARE HANDOFF
+PHASE 1–20 COMPATIBILITY CONTRACT
+Date: 2026-09-02
+
+PURPOSE
+=======
+The web/backend side now has support for:
+- telemetry history and trend analysis
+- notification rules
+- Care Score v2
+- sensor calibration
+- hardware diagnostics/capability discovery
+- Device page v2
+- command lifecycle UI
+- Automation Studio v2
+- reservoir management
+- capability/calibration-gated fertilizer control
+
+This handoff contains ONLY the embedded/FloraOS work needed to unlock hardware-dependent parts.
+Do not create new web endpoints. Do not replace the existing device transport.
+
+NON-NEGOTIABLE ARCHITECTURE
+===========================
+Keep the existing physical-device channel exactly as the authority boundary:
+
+HMAC_UP eFuse KEY0
+    -> derived AES-256-GCM keys
+    -> POST https://floraos.life/api/device/v1/message
+
+Do NOT:
+- replace /api/device/v1/message
+- create plaintext device auth/control/claim routes
+- expose HMAC/AES/eFuse material
+- make browser-supplied device_id authoritative
+- weaken replay protection
+- allow normal commands during SETUP_IDLE / SETUP_CONNECTING /
+  SETUP_WIFI_CONNECTED / SETUP_CLAIMING
+- let commands override OTA/setup safety
+
+The existing encrypted claim flow remains unchanged.
+The existing at-least-once command protocol remains command_protocol=1 unless a deliberate
+protocol upgrade is separately coordinated.
+
+1. AUTHENTICATED CAPABILITY DISCOVERY
+=====================================
+Add a capabilities object to an authenticated heartbeat or telemetry payload.
+Recommended shape:
+
+{
+  "mode": "NORMAL",
+  "command_protocol": 1,
+  "capabilities": {
+    "schema": 1,
+    "sensors": {
+      "soil": true,
+      "light": true,
+      "temperature": false,
+      "humidity": false,
+      "water_level": false,
+      "fertilizer_level": false,
+      "leak": false
+    },
+    "actuators": {
+      "water_pump": true,
+      "grow_light": true,
+      "fertilizer_pump": false
+    },
+    "commands": {
+      "water": 1,
+      "grow_light": 1,
+      "fertilize": 0
+    }
+  }
+}
+
+Rules:
+- Report TRUE/1 only for hardware that actually exists and firmware that actually supports it.
+- Missing hardware must be false or omitted; never fabricate support.
+- Until the fertilizer implementation below is complete and physically tested, report:
+    "fertilizer_pump": false
+    "fertilize": 0
+- Capabilities must travel inside the existing encrypted/authenticated payload.
+
+2. DIAGNOSTICS TELEMETRY
+========================
+Add authenticated diagnostics fields where available. Recommended shape:
+
+"diagnostics": {
+  "wifi_rssi_dbm": -54,
+  "uptime_seconds": 18422,
+  "free_heap_bytes": 312000,
+  "min_free_heap_bytes": 248000,
+  "psram_free_bytes": 6120000,
+  "reset_reason": "POWERON_RESET",
+  "project_name": "FloraCore",
+  "firmware_version": "1.0.2",
+  "hardware_revision": "prototype-s3-n16r8",
+  "command_protocol": 1,
+  "faults": []
+}
+
+Do not send fake zeroes for unsupported values. Omit them or provide a validity field.
+
+3. TELEMETRY SCHEMA FOR WEB HISTORY/CALIBRATION
+===============================================
+The web already understands these canonical fields:
+
+soil_adc                    raw soil reading (already available today)
+soil_percent                calibrated/firmware soil percentage
+light_lux                   lux
+light_valid                 boolean
+
+temperature_c               optional
+humidity_percent            optional
+
+water_level_raw             optional raw reservoir sensor
+water_level_percent         optional 0–100
+fertilizer_level_raw        optional raw reservoir sensor
+fertilizer_level_percent    optional 0–100
+
+pump_on                     water pump state
+grow_light_on               optional grow-light state
+fertilizer_pump_on          optional dosing-pump state
+leak_detected               optional hard-safety telemetry
+
+Rules:
+- Keep current soil_adc; it enables server-side two-point calibration.
+- Add raw + engineering-unit values when a physical sensor exists.
+- If a read fails, do not send 0 as if it were a real sample. Omit the field or send a separate validity flag.
+- Preserve original authenticated sample timing behavior.
+
+4. COMMAND RESULT LIFECYCLE
+===========================
+Continue using the existing command_id dedupe / at-least-once behavior.
+For water and grow_light, ensure firmware can report meaningful command_result phases:
+
+ACKNOWLEDGED
+{
+  "command_id": "cmd_...",
+  "status": "acknowledged",
+  "result": {
+    "accepted_at_ms": 123456
+  }
+}
+
+COMPLETED
+{
+  "command_id": "cmd_...",
+  "status": "completed",
+  "result": {
+    "started_at_ms": 123456,
+    "finished_at_ms": 128456,
+    "actual_duration_ms": 5000
+  }
+}
+
+FAILED
+{
+  "command_id": "cmd_...",
+  "status": "failed",
+  "error": "reservoir_empty"
+}
+
+Use bounded error codes such as:
+- reservoir_empty
+- leak_detected
+- actuator_fault
+- setup_in_progress
+- ota_in_progress
+- local_safety_lockout
+- invalid_parameters
+
+Do not send secrets or stack traces.
+
+5. FERTILIZER COMMAND — KEEP DISABLED UNTIL SAFE
+===============================================
+The web fails closed and will NOT queue this command unless both are true:
+A. authenticated capabilities report fertilizer pump + fertilize command support
+B. the owner has saved a pump-flow calibration
+
+Expected command shape after it is deliberately enabled:
+
+{
+  "id": "cmd_...",
+  "type": "fertilize",
+  "parameters": {
+    "volume_ml": 2.5,
+    "duration_ms": 2500,
+    "calibration_ml_per_second": 1.0
+  },
+  "expires_at": 1788290000
+}
+
+FIRMWARE MUST NOT TRUST THE SERVER AS THE ONLY SAFETY LAYER.
+Independently validate all fertilizer commands locally.
+
+Minimum local requirements before reporting support:
+- separate fertilizer dosing actuator physically exists
+- pump output is fail-safe OFF at boot
+- command_id dedupe is implemented exactly like other physical commands
+- reject expired commands
+- reject during setup states
+- reject during OTA
+- leak fault blocks dosing
+- empty/insufficient fertilizer reservoir blocks dosing when sensor exists
+- hard maximum single dose
+- hard maximum runtime
+- rolling daily dose budget stored robustly enough for reboot behavior
+- pump failure cannot leave the actuator stuck ON
+- local watchdog/timeout forces OFF
+- parameters outside the local envelope are rejected
+
+Recommended initial absolute firmware limits should be AT LEAST as strict as web limits:
+- single dose <= 50 mL (prefer much lower for the actual prototype)
+- runtime <= 30 seconds
+- rolling 24-hour total <= 100 mL (prefer plant-specific lower limit)
+
+The web currently requires calibration before enabling this control, but firmware should still
+validate duration against its own known calibration/safety envelope.
+
+6. RESERVOIR + LEAK SAFETY
+==========================
+When the physical sensors are installed, report:
+- water_level_percent
+- fertilizer_level_percent
+- leak_detected
+
+Local safety has priority over cloud commands:
+leak_detected == true -> all liquid pumps OFF and commands fail
+water reservoir empty -> water command fails
+fertilizer reservoir empty -> fertilize command fails
+
+The cloud must never be the only layer that stops a pump.
+
+7. AUTOMATION STUDIO V2 BEHAVIOR
+================================
+No new firmware automation engine is required.
+Automation Studio v2 remains SERVER-SIDE and produces the same validated device_commands.
+
+Firmware responsibility is only:
+- receive at most the normal bounded command response
+- dedupe command_id
+- validate locally
+- execute safely
+- report command_result
+
+Do not implement server graph logic inside FloraOS.
+
+8. SCHEDULING / DELAY NOTE
+==========================
+The current web implementation resumes delayed multi-action automation steps on the first
+authenticated heartbeat/telemetry after their due time. Since heartbeat cadence is ~60 seconds,
+this is intentionally minute-scale, not hard real-time.
+
+Do not change heartbeat cadence solely for Automation Studio v2.
+Time-critical safety remains local firmware responsibility.
+
+9. CURRENT FIRMWARE COMPATIBILITY
+=================================
+Current telemetry already provides soil_adc, soil_percent, light_lux, light_valid, pump_on,
+RTC fields, and authenticated heartbeat. Keep all of that working.
+
+All new fields are additive.
+The web handles missing capabilities/diagnostics/sensors as “Not reported” rather than inventing data.
+
+10. ACCEPTANCE TEST BEFORE RETURNING HANDOFF
+============================================
+A. Existing claim succeeds unchanged.
+B. Existing heartbeat succeeds every ~60 s.
+C. Existing water command still dedupes and reports command result.
+D. Existing grow-light command still dedupes and reports command result.
+E. Setup states suppress normal commands.
+F. OTA still suppresses command delivery according to existing arbitration.
+G. Capabilities are encrypted/authenticated and truthful.
+H. Diagnostics are additive and do not make telemetry oversized.
+I. Invalid/unknown command types fail safely.
+J. fertilize remains unsupported until physical dosing safety tests pass.
+K. Once enabled, duplicate fertilize command_id can never double-dose.
+L. Leak/empty/local fault overrides every cloud fertilizer request.
+
+RETURN TO WEB DEVELOPMENT WITH
+==============================
+Please report:
+- exact capabilities JSON now emitted
+- exact diagnostics fields emitted
+- exact telemetry fields emitted
+- whether fertilize remains disabled or is implemented
+- local fertilizer hard limits if implemented
+- command_result shape for water/grow_light/fertilize
+- firmware project/version used for the test
+- build + flash test result
+
+END HANDOFF

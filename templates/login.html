@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07111F" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
+  <title>Sign in — FloraCore</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/auth-v3.css') }}" />
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='icons/favicon.svg') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/favicon-32x32.png') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="64x64" href="{{ url_for('static', filename='icons/favicon-64x64.png') }}?v=20260901">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='icons/favicon.ico') }}?v=20260901">
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='icons/apple-touch-icon.png') }}?v=20260901">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/turnstile.css') }}?v=20260901-turnstile1" />
+</head>
+<body>
+  <main class="auth-layout">
+    <a class="brand" href="/" aria-label="Return to FloraCore home">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span>FloraCore</span>
+    </a>
+
+    <section class="auth-card" aria-labelledby="login-title">
+      <div class="auth-status"><span class="status-dot"></span>CORE ACCESS / SECURE SESSION</div>
+      <h1 id="login-title">Sign in to FloraCore.</h1>
+      <p class="auth-intro">Access connected systems, device telemetry, and control services.</p>
+
+      <form id="loginForm" novalidate>
+        <input type="hidden" id="nextUrl" value="{{ next_url }}" />
+
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="email" inputmode="email" maxlength="254" placeholder="you@example.com" required />
+        </div>
+
+        <div class="field">
+          <div class="label-row"><label for="password">Password</label><a href="/docs#account-security">Forgot password?</a></div>
+          <div class="password-wrap">
+            <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" maxlength="128" required />
+            <button class="password-toggle" type="button" id="togglePassword" aria-label="Show password">Show</button>
+          </div>
+        </div>
+
+        <label class="remember"><input type="checkbox" name="remember" /> <span>Keep this session active</span></label>
+        {% if turnstile_enabled %}
+        <div class="flora-turnstile-wrap">
+        <div
+        class="flora-turnstile"
+        data-sitekey="{{ turnstile_site_key }}"
+        data-flora-action="login"
+        ></div>
+        <div class="flora-turnstile-status" aria-live="polite"></div>
+        <div class="flora-turnstile-caption">Bot protection active</div>
+        </div>
+        {% endif %}
+
+        <div style="text-align:right;margin:2px 0 8px"><a href="/forgot-password" style="color:#92C3D3;font-size:.74rem;text-decoration:none">Forgot password?</a></div>
+        <button class="submit-btn" type="submit">Sign in <span aria-hidden="true">→</span></button>
+        <div class="message{% if oauth_error %} error{% endif %}" id="message" aria-live="polite">{{ oauth_error or '' }}</div>
+      </form>
+
+      <div class="auth-switch">
+        <span>NO FLORACORE ID</span>
+        <a href="/signup">Create an account <span aria-hidden="true">→</span></a>
+      </div>
+
+      <div class="divider"><span>IDENTITY PROVIDERS</span></div>
+      <div class="social-grid" aria-label="External sign-in providers">
+        {% if oauth_configured.google %}
+          <a class="social-button" href="{{ url_for('oauth_start', provider='google', next=next_url, source='login') }}">
+            <span class="provider-mark" aria-hidden="true">G</span>
+            <span class="provider-label">Continue with Google</span>
+            <span class="provider-arrow" aria-hidden="true">→</span>
+          </a>
+        {% else %}
+          <button type="button" disabled title="Google OAuth credentials are not configured on the server">
+            <span class="provider-mark" aria-hidden="true">G</span>
+            <span class="provider-label">Google</span>
+            <small>NOT CONFIGURED</small>
+          </button>
+        {% endif %}
+
+        {% if oauth_configured.github %}
+          <a class="social-button" href="{{ url_for('oauth_start', provider='github', next=next_url, source='login') }}">
+            <span class="provider-mark provider-mark-wide" aria-hidden="true">GH</span>
+            <span class="provider-label">Continue with GitHub</span>
+            <span class="provider-arrow" aria-hidden="true">→</span>
+          </a>
+        {% else %}
+          <button type="button" disabled title="GitHub OAuth credentials are not configured on the server">
+            <span class="provider-mark provider-mark-wide" aria-hidden="true">GH</span>
+            <span class="provider-label">GitHub</span>
+            <small>NOT CONFIGURED</small>
+          </button>
+        {% endif %}
+      </div>
+      <p class="provider-note">FloraCore requests only the identity information needed to sign you in. OAuth access tokens are not stored.</p>
+    </section>
+
+    <div class="auth-footer"><a href="/">← Return to platform</a><span>flora-auth-01 · OAuth state protected</span></div>
+  </main>
+  <script src="{{ url_for('static', filename='js/login.js') }}" defer></script>
+  {% if turnstile_enabled %}
+  <script src="{{ url_for('static', filename='js/turnstile_auth.js') }}?v=20260901-turnstile1" defer></script>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" defer></script>
+  {% endif %}
+</body>
+</html>

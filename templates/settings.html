@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07111F" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
+  <title>Settings — FloraCore</title>
+
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='icons/favicon.svg') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/favicon-32x32.png') }}?v=20260901">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='icons/favicon.ico') }}?v=20260901">
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}?v=20260901-security-center1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/settings.css') }}?v=20260901-security-center1" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="FloraCore home">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span>FloraCore</span>
+    </a>
+
+    <div class="topbar-meta">
+      <span class="settings-security-badge"><i></i>SECURITY CENTER</span>
+      <span>USER ID {{ user_id }}</span>
+      <span>{{ user_email }}</span>
+      <a class="settings-top-button" href="/dashboard">Dashboard</a>
+    </div>
+  </header>
+
+  <main class="settings-shell">
+    <aside class="sidebar settings-sidebar" aria-label="FloraOS navigation">
+      {% if connect_only %}
+        <span class="side-label">ONBOARDING</span>
+        <a class="connect-link" href="/connect"><span aria-hidden="true">↗</span>Connect</a>
+        <a href="/plants">Plants</a>
+        <a href="/notifications">Notifications</a>
+        <a href="/automations/v2">Automation v2</a>
+        <a class="active" href="/settings">Settings</a>
+
+        <span class="side-label second">HELP</span>
+        <a href="/docs">Documentation</a>
+      {% else %}
+        <span class="side-label">WORKSPACE</span>
+        <a href="/dashboard">Overview</a>
+        <a href="/plants">Plants</a>
+        <a href="/automations">Automations</a>
+        <a class="active" href="/settings">Settings</a>
+
+        <span class="side-label second">DEVELOPER</span>
+        <a href="/settings/developer">Developer API</a>
+        <a href="/docs">Documentation</a>
+
+        <span class="side-label second">LINK</span>
+        <a class="connect-link" href="/connect"><span aria-hidden="true">↗</span>Connect</a>
+      {% endif %}
+    </aside>
+
+    <section class="settings-main">
+      <div class="settings-heading">
+        <span class="eyebrow">ACCOUNT / SECURITY / DEVICE CONTROL</span>
+        <h1>Settings</h1>
+        <p>Manage your account, sign-in security, active sessions, security history, and direct FloraCore controls.</p>
+      </div>
+
+      {% if connect_only %}
+      <section class="settings-onboarding-note">
+        <div>
+          <span>ACCOUNT READY</span>
+          <b>Secure your account before connecting hardware.</b>
+          <p>Account and security settings work immediately. Device Control unlocks after your first FloraCore is linked.</p>
+        </div>
+        <a href="/connect">Connect FloraCore <span aria-hidden="true">→</span></a>
+      </section>
+      {% endif %}
+
+      <div class="settings-workspace">
+        <nav class="settings-section-nav" aria-label="Settings sections">
+          <a href="#account" class="active">Account</a>
+          <a href="#password">Password</a>
+          <a href="#mfa">MFA</a>
+          <a href="#sessions">Sessions</a>
+          <a href="#activity">Security activity</a>
+          <a href="#device-control">Device Control</a>
+        </nav>
+
+        <div class="settings-panels">
+          <section class="settings-panel" id="account">
+            <div class="settings-panel-head">
+              <div>
+                <span>ACCOUNT</span>
+                <h2>Profile</h2>
+              </div>
+            </div>
+            <dl class="account-details compact">
+              <div><dt>User ID</dt><dd>{{ user_id }}</dd></div>
+              <div><dt>Email</dt><dd>{{ user_email }}</dd></div>
+            </dl>
+            <p class="settings-muted">Your numeric User ID identifies the account; authentication still comes from your signed session or API token.</p>
+          </section>
+
+          <section class="settings-panel security-unlock-panel">
+            <div class="security-gate {% if security_verified %}verified{% endif %}" id="securityGate">
+              <div class="security-gate-copy">
+                <span>SENSITIVE CHANGES</span>
+                <b id="securityGateTitle">
+                  {% if security_verified %}Security changes unlocked{% else %}Verify sensitive account changes{% endif %}
+                </b>
+                <small id="securityGateText">
+                  {% if security_verified %}
+                    Password, MFA, and session controls are unlocked for a few minutes.
+                  {% else %}
+                    FloraCore will send a confirmation code to your account email.
+                  {% endif %}
+                </small>
+              </div>
+              <div class="security-gate-actions">
+                <button class="settings-button secondary" id="sendSecurityCodeButton" type="button" {% if security_verified %}hidden{% endif %}>Send code</button>
+              </div>
+              <div class="security-code-form" id="securityCodeForm" hidden>
+                <input id="securityCodeInput" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" />
+                <button class="settings-button primary" id="verifySecurityCodeButton" type="button">Verify</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-panel" id="password">
+            <div class="settings-panel-head">
+              <div>
+                <span>PASSWORD</span>
+                <h2>Change password</h2>
+              </div>
+            </div>
+
+            <div class="settings-form-grid password-form-grid">
+              <label class="settings-field">
+                <span>CURRENT PASSWORD</span>
+                <input id="currentPasswordInput" type="password" autocomplete="current-password" placeholder="Required for password sign-in accounts" />
+              </label>
+              <label class="settings-field">
+                <span>NEW PASSWORD</span>
+                <input id="newPasswordInput" type="password" autocomplete="new-password" minlength="8" maxlength="128" />
+              </label>
+              <label class="settings-field">
+                <span>CONFIRM NEW PASSWORD</span>
+                <input id="confirmNewPasswordInput" type="password" autocomplete="new-password" minlength="8" maxlength="128" />
+              </label>
+            </div>
+
+            <div class="panel-footer">
+              <p>Changing your password revokes every other active browser session.</p>
+              <button class="settings-button primary security-sensitive-control" id="changePasswordButton" type="button" {% if not security_verified %}disabled{% endif %}>Change password</button>
+            </div>
+            <div class="section-message" id="passwordMessage"></div>
+          </section>
+
+          <section class="settings-panel mfa-panel" id="mfa">
+            <div class="settings-panel-head mfa-head">
+              <div>
+                <span>MULTI-FACTOR AUTHENTICATION</span>
+                <h2>Sign-in verification</h2>
+              </div>
+              <span class="mfa-status-pill" id="mfaStatusPill">
+                {% if mfa_status.enabled %}ENABLED{% else %}OFF{% endif %}
+              </span>
+            </div>
+
+            <div class="mfa-current">
+              <div>
+                <span>CURRENT METHOD</span>
+                <b id="mfaCurrentMethod">
+                  {% if mfa_status.method == "email" %}Email code
+                  {% elif mfa_status.method == "totp" %}Authenticator app
+                  {% else %}None{% endif %}
+                </b>
+              </div>
+              <p id="mfaCurrentDescription">
+                {% if mfa_status.method == "email" %}
+                  FloraCore emails a one-time code after primary sign-in.
+                {% elif mfa_status.method == "totp" %}
+                  Enter a rotating code from your authenticator after primary sign-in.
+                {% else %}
+                  Add a second factor to your FloraCore account.
+                {% endif %}
+              </p>
+            </div>
+
+            <div class="mfa-method-grid">
+              <article class="mfa-method-card">
+                <div class="method-icon">@</div>
+                <div class="method-copy">
+                  <span>EMAIL</span>
+                  <h3>Email verification code</h3>
+                  <p>Receive a six-digit code at your account email whenever MFA is required.</p>
+                </div>
+                <button class="settings-button secondary mfa-change-control security-sensitive-control" id="enableEmailMfaButton" type="button" {% if not security_verified %}disabled{% endif %}>
+                  {% if mfa_status.method == "email" and mfa_status.enabled %}Enabled{% else %}Use email{% endif %}
+                </button>
+              </article>
+
+              <article class="mfa-method-card preferred">
+                <div class="method-icon">⌁</div>
+                <div class="method-copy">
+                  <span>AUTHENTICATOR</span>
+                  <h3>Authenticator app</h3>
+                  <p>Use standard TOTP with Google Authenticator, Microsoft Authenticator, 1Password, Aegis, and other compatible apps.</p>
+                </div>
+                <button class="settings-button secondary mfa-change-control security-sensitive-control" id="startAuthenticatorButton" type="button" {% if not security_verified %}disabled{% endif %}>
+                  {% if mfa_status.method == "totp" and mfa_status.enabled %}Reconfigure{% else %}Set up{% endif %}
+                </button>
+              </article>
+            </div>
+
+            <section class="authenticator-setup" id="authenticatorSetup" hidden>
+              <div class="setup-step">
+                <span>01</span>
+                <div><b>Add FloraCore to your authenticator</b><p>Enter this setup key in your authenticator app.</p></div>
+              </div>
+              <div class="setup-key-row">
+                <code id="authenticatorSetupKey">—</code>
+                <button class="copy-button" id="copySetupKeyButton" type="button">Copy</button>
+              </div>
+              <details class="otpauth-details">
+                <summary>Advanced: show otpauth URI</summary>
+                <code id="authenticatorUri">—</code>
+              </details>
+              <div class="setup-step second">
+                <span>02</span>
+                <div><b>Confirm one code</b><p>MFA is not enabled until the current app code validates.</p></div>
+              </div>
+              <div class="authenticator-confirm-row">
+                <input id="authenticatorCodeInput" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" />
+                <button class="settings-button primary" id="confirmAuthenticatorButton" type="button">Confirm authenticator</button>
+              </div>
+            </section>
+
+            <div class="mfa-footer-actions">
+              <div class="recovery-summary" id="recoverySummary" {% if mfa_status.method != "totp" or not mfa_status.enabled %}hidden{% endif %}>
+                <span>RECOVERY CODES</span>
+                <b id="recoveryRemaining">{{ mfa_status.recovery_codes_remaining }} remaining</b>
+              </div>
+              <button class="settings-button secondary mfa-change-control security-sensitive-control" id="regenerateRecoveryButton" type="button"
+                {% if mfa_status.method != "totp" or not mfa_status.enabled %}hidden{% endif %}
+                {% if not security_verified %}disabled{% endif %}>New recovery codes</button>
+              <button class="settings-button danger mfa-change-control security-sensitive-control" id="disableMfaButton" type="button"
+                {% if not mfa_status.enabled %}hidden{% endif %}
+                {% if not security_verified %}disabled{% endif %}>Disable MFA</button>
+            </div>
+            <div class="settings-message" id="settingsMessage" role="status" aria-live="polite"></div>
+          </section>
+
+          <section class="settings-panel" id="sessions">
+            <div class="settings-panel-head">
+              <div>
+                <span>ACTIVE SESSIONS</span>
+                <h2>Where you're signed in</h2>
+              </div>
+              <button class="settings-button secondary security-sensitive-control" id="revokeOtherSessionsButton" type="button" {% if not security_verified %}disabled{% endif %}>Sign out others</button>
+            </div>
+            <div class="session-list" id="sessionList">
+              <div class="loading-row">Loading sessions…</div>
+            </div>
+            <div class="section-message" id="sessionsMessage"></div>
+          </section>
+
+          <section class="settings-panel" id="activity">
+            <div class="settings-panel-head">
+              <div>
+                <span>SECURITY ACTIVITY</span>
+                <h2>Recent account events</h2>
+              </div>
+              <button class="settings-button secondary" id="refreshActivityButton" type="button">Refresh</button>
+            </div>
+            <div class="activity-list" id="activityList">
+              <div class="loading-row">Loading security activity…</div>
+            </div>
+          </section>
+
+          <section class="settings-panel device-control-panel" id="device-control">
+            <div class="settings-panel-head">
+              <div>
+                <span>DEVICE CONTROL</span>
+                <h2>Manual hardware controls</h2>
+              </div>
+              <span class="control-path-chip">Validated command queue</span>
+            </div>
+
+            {% if connect_only %}
+            <div class="device-control-empty">
+              <b>No FloraCore is linked yet.</b>
+              <p>Connect a device before using manual water or grow-light controls.</p>
+              <a href="/connect">Connect FloraCore →</a>
+            </div>
+            {% else %}
+            <div class="device-control-body">
+              <label class="settings-field device-picker">
+                <span>FLORACORE</span>
+                <select id="controlDeviceSelect"></select>
+              </label>
+
+              <div class="control-readiness" id="controlReadiness">
+                <span class="status-dot"></span>
+                <b>Checking device…</b>
+              </div>
+
+              <div class="control-card-grid">
+                <article class="control-card">
+                  <span>WATER</span>
+                  <h3>Run pump</h3>
+                  <p>Queues a bounded watering command through the existing encrypted device channel.</p>
+                  <label class="mini-field">
+                    <span>DURATION</span>
+                    <div><input id="waterDurationInput" type="number" min="0.5" max="30" step="0.5" value="5" /><em>sec</em></div>
+                  </label>
+                  <button class="settings-button primary physical-control" id="waterNowButton" type="button">Water now</button>
+                </article>
+
+                <article class="control-card">
+                  <span>GROW LIGHT</span>
+                  <h3>Lighting</h3>
+                  <p>Turns the grow light on for a bounded duration, or queues an explicit off command.</p>
+                  <label class="mini-field">
+                    <span>ON DURATION</span>
+                    <div><input id="growLightDurationInput" type="number" min="1" max="720" step="1" value="30" /><em>min</em></div>
+                  </label>
+                  <div class="control-button-row">
+                    <button class="settings-button primary physical-control" id="growLightOnButton" type="button">Turn on</button>
+                    <button class="settings-button secondary physical-control" id="growLightOffButton" type="button">Turn off</button>
+                  </div>
+                </article>
+              </div>
+              <div class="control-safety-note">
+                <b>Safety remains server-side.</b>
+                Watering cooldowns, command expiry, ownership, online state, command protocol support, and OTA exclusion are still enforced by FloraOS.
+              </div>
+              <div class="section-message" id="deviceControlMessage"></div>
+            </div>
+            {% endif %}
+          </section>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="recovery-modal" id="recoveryModal" hidden>
+    <section class="recovery-modal-card" role="dialog" aria-modal="true" aria-labelledby="recoveryModalTitle">
+      <span class="modal-kicker">ONE-TIME DISPLAY</span>
+      <h2 id="recoveryModalTitle">Save your recovery codes</h2>
+      <p>Each code works once if you lose access to your authenticator. FloraCore will not show these exact codes again.</p>
+      <div class="recovery-codes" id="recoveryCodes"></div>
+      <div class="recovery-modal-actions">
+        <button class="settings-button secondary" id="copyRecoveryCodesButton" type="button">Copy all</button>
+        <button class="settings-button primary" id="closeRecoveryModalButton" type="button">I saved them</button>
+      </div>
+    </section>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/settings.js') }}?v=20260901-security-center1" defer></script>
+</body>
+</html>
