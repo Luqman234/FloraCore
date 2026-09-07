@@ -27,13 +27,14 @@
 #include "wifi_credentials.h"
 #include "wifi_manager.h"
 
-#define I2C_SDA_GPIO 10
-#define I2C_SCL_GPIO 11
-#define SOIL_MOISTURE_GPIO 8
-#define WATER_PUMP_GPIO GPIO_NUM_40
+#define I2C_SDA_GPIO 40
+#define I2C_SCL_GPIO 45
+#define SOIL_MOISTURE_GPIO 10
+#define WATER_PUMP_GPIO GPIO_NUM_47
+#define PERISTALTIC_PUMP_GPIO GPIO_NUM_38
 
 #ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
-#define GROW_LIGHT_GPIO ((gpio_num_t)CONFIG_FLORACORE_GROW_LIGHT_GPIO)
+#define GROW_LIGHT_GPIO GPIO_NUM_1
 #endif
 
 #define BH1750_ADDRESS 0x23
@@ -101,6 +102,25 @@ static void water_pump_init(void)
 
     ESP_ERROR_CHECK(gpio_config(&config));
     gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+}
+
+static void peristaltic_pump_init(void)
+{
+    /*
+     * Fertilizer dosing remains intentionally disabled for now. Configure
+     * the physical GPIO as an output and force the pump OFF so the hardware
+     * always starts in a safe state.
+     */
+    gpio_config_t config = {
+        .pin_bit_mask = (1ULL << PERISTALTIC_PUMP_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&config));
+    ESP_ERROR_CHECK(gpio_set_level(PERISTALTIC_PUMP_GPIO, PUMP_OFF));
 }
 
 static void water_pump_on(void)
@@ -694,6 +714,7 @@ void app_main(void)
 
     if (boot_mode == FLORACORE_MODE_NORMAL) {
         water_pump_init();
+        peristaltic_pump_init();
 
 #ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
         grow_light_init();
