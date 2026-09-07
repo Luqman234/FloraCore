@@ -16,6 +16,9 @@ typedef struct
 
     esp_err_t (*grow_light_set)(bool on);
     bool (*grow_light_get)(void);
+
+    esp_err_t (*fertilizer_set)(bool on);
+    bool (*fertilizer_get)(void);
 } floraos_phase20_ops_t;
 
 typedef struct
@@ -33,6 +36,9 @@ typedef struct
 
     bool grow_light_valid;
     bool grow_light_on;
+
+    bool fertilizer_pump_valid;
+    bool fertilizer_pump_on;
 
     bool rtc_valid;
     char rtc_text[32];
@@ -77,6 +83,14 @@ esp_err_t floraos_phase20_queue_message(
 /* Local safety integration. */
 void floraos_phase20_set_water_lockout(bool locked);
 bool floraos_phase20_water_command_active(void);
+
+/*
+ * True while a timed authenticated grow-light ON command is holding the
+ * actuator. Local light automation should not override it until the timer
+ * expires.
+ */
+bool floraos_phase20_grow_light_override_active(void);
+
 void floraos_phase20_force_safe_outputs(void);
 
 #endif
