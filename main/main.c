@@ -61,18 +61,23 @@
 /*
  * Local grow-light policy.
  *
- * RTC provides the hard photoperiod. BH1750 decides whether supplemental
- * light is actually needed. The OFF threshold is intentionally much higher
- * than the ON threshold so the grow light does not chase its own lux reading.
+ * RTC provides a 14-hour photoperiod (06:00-20:00). The BH1750 is used as an
+ * AMBIENT-light gate before the lamp turns on.
  *
- * These are prototype commissioning defaults. Tune them after the BH1750 is
- * mounted in its final position near canopy height.
+ * Typical occupied rooms are only a few hundred lux, while sunny indoor
+ * positions can approach roughly 1000 lux. For an indoor herb prototype,
+ * ambient light below 1000 lux therefore requests supplemental lighting.
+ *
+ * Once the grow light is ON, BH1750 is deliberately NOT used to turn it back
+ * OFF: the sensor would see the grow light itself and could create a feedback
+ * loop. The RTC hard-stop at 20:00 ends the photoperiod.
+ *
+ * Tune this threshold after the BH1750 is mounted in its final position near
+ * canopy height.
  */
 #define GROW_LIGHT_START_HOUR 6
 #define GROW_LIGHT_END_HOUR 20
-#define GROW_LIGHT_ON_BELOW_LUX 3000.0f
-#define GROW_LIGHT_OFF_ABOVE_LUX 20000.0f
-#define GROW_LIGHT_MIN_ON_SECONDS 900
+#define GROW_LIGHT_ON_BELOW_LUX 1000.0f
 #define GROW_LIGHT_MIN_OFF_SECONDS 60
 
 /*
@@ -565,13 +570,11 @@ static void grow_light_apply_local_policy(
         return;
     }
 
-    if (
-        current &&
-        lux >= GROW_LIGHT_OFF_ABOVE_LUX &&
-        grow_light_dwell_elapsed(GROW_LIGHT_MIN_ON_SECONDS)
-    ) {
-        grow_light_set_local(false, "BH1750 detected strong daylight");
-    }
+    /*
+     * If already ON, keep the lamp ON until the RTC photoperiod ends.
+     * Do not compare the BH1750 reading against an OFF threshold here because
+     * the sensor is also illuminated by the grow light itself.
+     */
 }
 
 static uint32_t fertilizer_date_key(const rtc_time_t *rtc)
