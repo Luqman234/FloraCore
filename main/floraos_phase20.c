@@ -980,7 +980,10 @@ esp_err_t floraos_phase20_init(const floraos_phase20_ops_t *ops)
     if (task_ok != pdPASS) return ESP_ERR_NO_MEM;
 
     s_initialized = true;
-    ESP_LOGI(TAG, "Command protocol v1 ready; fertilizer remains disabled");
+    ESP_LOGI(
+        TAG,
+        "Command protocol v1 ready; local fertilizer automation available, cloud fertilize command disabled"
+    );
     return ESP_OK;
 }
 
@@ -1102,12 +1105,16 @@ static void add_capabilities(cJSON *root)
     cJSON_AddBoolToObject(sensors, "leak", false);
 
     cJSON_AddBoolToObject(actuators, "water_pump", true);
-#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
-    cJSON_AddBoolToObject(actuators, "grow_light", true);
-#else
-    cJSON_AddBoolToObject(actuators, "grow_light", false);
-#endif
-    cJSON_AddBoolToObject(actuators, "fertilizer_pump", false);
+    cJSON_AddBoolToObject(
+        actuators,
+        "grow_light",
+        s_ops.grow_light_set != NULL && s_ops.grow_light_get != NULL
+    );
+    cJSON_AddBoolToObject(
+        actuators,
+        "fertilizer_pump",
+        s_ops.fertilizer_set != NULL && s_ops.fertilizer_get != NULL
+    );
 
     cJSON_AddNumberToObject(commands, "water", 1);
 #ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
@@ -1193,6 +1200,14 @@ char *floraos_phase20_build_telemetry(
         cJSON_AddBoolToObject(root, "grow_light_on", sample->grow_light_on);
     }
 
+    if (sample->fertilizer_pump_valid) {
+        cJSON_AddBoolToObject(
+            root,
+            "fertilizer_pump_on",
+            sample->fertilizer_pump_on
+        );
+    }
+
     cJSON_AddBoolToObject(root, "rtc_valid", sample->rtc_valid);
     if (sample->rtc_valid && sample->rtc_text[0] != '\0') {
         cJSON_AddStringToObject(root, "rtc", sample->rtc_text);
@@ -1253,6 +1268,18 @@ bool floraos_phase20_water_command_active(void)
     return active;
 }
 
+bool floraos_phase20_grow_light_override_active(void)
+{
+#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
+    return
+        s_initialized &&
+        s_grow_light_timer != NULL &&
+        esp_timer_is_active(s_grow_light_timer);
+#else
+    return false;
+#endif
+}
+
 void floraos_phase20_force_safe_outputs(void)
 {
     if (!s_initialized) return;
@@ -1265,8 +1292,13 @@ void floraos_phase20_force_safe_outputs(void)
     if (s_grow_light_timer != NULL) {
         (void)esp_timer_stop(s_grow_light_timer);
     }
+#endif
+
     if (s_ops.grow_light_set != NULL) {
         (void)s_ops.grow_light_set(false);
     }
-#endif
+
+    if (s_ops.fertilizer_set != NULL) {
+        (void)s_ops.fertilizer_set(false);
+    }
 }
