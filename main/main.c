@@ -45,7 +45,7 @@
 #define PUMP_ON 1
 #define PUMP_OFF 0
 #define SAMPLE_COUNT 5
-#define FLORAOS_HEARTBEAT_INTERVAL_SECONDS 60
+#define FLORAOS_HEARTBEAT_INTERVAL_SECONDS 10
 
 /*
  * Only a newly-installed OTA candidate waits here.  This gives the common
@@ -926,7 +926,7 @@ void app_main(void)
     uint32_t cloud_cycle = 0;
 
     /*
-     * NORMAL mode sends a dedicated authenticated heartbeat every 60 seconds.
+     * NORMAL mode sends a dedicated authenticated heartbeat every 10 seconds.
      * Start at zero so the first heartbeat is sent as soon as normal cloud
      * traffic becomes available after first-time setup succeeds.
      */
@@ -948,8 +948,25 @@ void app_main(void)
             ESP_LOGI(TAG, "Average Light: %.2f lux", average_lux);
         }
 
-        if (ds3231_read_time(&rtc) == ESP_OK) {
+        esp_err_t rtc_err = ds3231_read_time(&rtc);
+        if (rtc_err == ESP_OK) {
             rtc_valid = true;
+            ESP_LOGI(
+                TAG,
+                "RTC: %02u:%02u:%02u %02u/%02u/20%02u",
+                rtc.hours,
+                rtc.minutes,
+                rtc.seconds,
+                rtc.date,
+                rtc.month,
+                rtc.year
+            );
+        } else {
+            ESP_LOGW(
+                TAG,
+                "RTC read failed: %s",
+                esp_err_to_name(rtc_err)
+            );
         }
 
         if (soil_moisture_read_average(&average_soil) == ESP_OK) {
@@ -960,6 +977,12 @@ void app_main(void)
                 if (!floraos_phase20_water_command_active()) {
                     water_pump_off();
                 }
+
+                ESP_LOGW(
+                    TAG,
+                    "Soil ADC: %d | Sensor appears OUT OF SOIL / disconnected | PUMP: OFF",
+                    average_soil
+                );
             } else {
                 floraos_phase20_set_water_lockout(false);
 
@@ -995,6 +1018,12 @@ void app_main(void)
             if (!floraos_phase20_water_command_active()) {
                 water_pump_off();
             }
+
+            ESP_LOGW(
+                TAG,
+                "Soil moisture ADC read failed on GPIO%d",
+                SOIL_MOISTURE_GPIO
+            );
         }
 
         pump_for_cloud = phase20_water_get();
