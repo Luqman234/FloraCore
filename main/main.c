@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
 #include "esp_timer.h"
+#include "nvs.h"
 
 #include "sdkconfig.h"
 
@@ -32,10 +33,7 @@
 #define SOIL_MOISTURE_GPIO 10
 #define WATER_PUMP_GPIO GPIO_NUM_47
 #define PERISTALTIC_PUMP_GPIO GPIO_NUM_38
-
-#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
 #define GROW_LIGHT_GPIO GPIO_NUM_1
-#endif
 
 #define BH1750_ADDRESS 0x23
 #define DS3231_ADDRESS 0x68
@@ -60,6 +58,44 @@
 #define SOIL_DRY_PERCENT 30
 #define SOIL_WET_PERCENT 70
 
+/*
+ * Local grow-light policy.
+ *
+ * RTC provides the hard photoperiod. BH1750 decides whether supplemental
+ * light is actually needed. The OFF threshold is intentionally much higher
+ * than the ON threshold so the grow light does not chase its own lux reading.
+ *
+ * These are prototype commissioning defaults. Tune them after the BH1750 is
+ * mounted in its final position near canopy height.
+ */
+#define GROW_LIGHT_START_HOUR 6
+#define GROW_LIGHT_END_HOUR 20
+#define GROW_LIGHT_ON_BELOW_LUX 3000.0f
+#define GROW_LIGHT_OFF_ABOVE_LUX 20000.0f
+#define GROW_LIGHT_MIN_ON_SECONDS 900
+#define GROW_LIGHT_MIN_OFF_SECONDS 60
+
+/*
+ * Local fertilizer policy.
+ *
+ * DS3231 day numbering follows sync_rtc_from_ntp():
+ * Sunday=1, Monday=2, ... Saturday=7.
+ *
+ * The peristaltic pump is deliberately NOT exposed as a cloud fertilize
+ * command yet. A short weekly local dose is scheduled from the RTC and the
+ * date is persisted BEFORE actuation so reboot cannot double-dose that day.
+ *
+ * IMPORTANT: calibrate FERTILIZER_RUN_MS against the actual pump flow and
+ * nutrient concentration before putting fertilizer in the reservoir.
+ */
+#define FERTILIZER_DAY_OF_WEEK 2
+#define FERTILIZER_HOUR 8
+#define FERTILIZER_MINUTE 0
+#define FERTILIZER_WINDOW_MINUTES 5
+#define FERTILIZER_RUN_MS 2000
+#define FERTILIZER_NVS_NAMESPACE "fertauto"
+#define FERTILIZER_NVS_LAST_DATE_KEY "last_date"
+
 #define TEMP_WIFI_PROVISIONING 0
 
 static const char *TAG = "FLORACORE";
@@ -68,6 +104,11 @@ static i2c_master_dev_handle_t bh1750_handle;
 static i2c_master_dev_handle_t ds3231_handle;
 static adc_oneshot_unit_handle_t adc_handle;
 static adc_channel_t soil_adc_channel;
+
+static int64_t grow_light_last_change_us = 0;
+static esp_timer_handle_t fertilizer_timer = NULL;
+static nvs_handle_t fertilizer_nvs = 0;
+static bool fertilizer_nvs_open = false;
 
 typedef struct
 {
@@ -106,11 +147,6 @@ static void water_pump_init(void)
 
 static void peristaltic_pump_init(void)
 {
-    /*
-     * Fertilizer dosing remains intentionally disabled for now. Configure
-     * the physical GPIO as an output and force the pump OFF so the hardware
-     * always starts in a safe state.
-     */
     gpio_config_t config = {
         .pin_bit_mask = (1ULL << PERISTALTIC_PUMP_GPIO),
         .mode = GPIO_MODE_OUTPUT,
@@ -121,6 +157,24 @@ static void peristaltic_pump_init(void)
 
     ESP_ERROR_CHECK(gpio_config(&config));
     ESP_ERROR_CHECK(gpio_set_level(PERISTALTIC_PUMP_GPIO, PUMP_OFF));
+}
+
+static esp_err_t phase20_fertilizer_set(bool on)
+{
+    if (on && ota_manager_update_in_progress()) {
+        (void)gpio_set_level(PERISTALTIC_PUMP_GPIO, PUMP_OFF);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return gpio_set_level(
+        PERISTALTIC_PUMP_GPIO,
+        on ? PUMP_ON : PUMP_OFF
+    );
+}
+
+static bool phase20_fertilizer_get(void)
+{
+    return gpio_get_level(PERISTALTIC_PUMP_GPIO) == PUMP_ON;
 }
 
 static void water_pump_on(void)
@@ -160,7 +214,6 @@ static bool phase20_water_get(void)
     return gpio_get_level(WATER_PUMP_GPIO) == PUMP_ON;
 }
 
-#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
 static void grow_light_init(void)
 {
     gpio_config_t config = {
@@ -189,7 +242,6 @@ static bool phase20_grow_light_get(void)
 {
     return gpio_get_level(GROW_LIGHT_GPIO) != 0;
 }
-#endif
 
 static esp_err_t bh1750_init(void)
 {
@@ -323,6 +375,19 @@ static esp_err_t sync_rtc_from_ntp(void)
         (uint8_t)timeinfo.tm_sec
     );
 
+    if (err == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "NTP synchronized -> DS3231: %02d:%02d:%02d %02d/%02d/%04d",
+            timeinfo.tm_hour,
+            timeinfo.tm_min,
+            timeinfo.tm_sec,
+            timeinfo.tm_mday,
+            timeinfo.tm_mon + 1,
+            timeinfo.tm_year + 1900
+        );
+    }
+
     esp_netif_sntp_deinit();
     return err;
 }
@@ -391,6 +456,287 @@ static const char *soil_get_status(int moisture_percent)
     if (moisture_percent < SOIL_DRY_PERCENT) return "DRY";
     if (moisture_percent < SOIL_WET_PERCENT) return "GOOD";
     return "WET";
+}
+
+
+static bool rtc_calendar_valid(const rtc_time_t *rtc)
+{
+    if (rtc == NULL) return false;
+
+    return
+        rtc->seconds <= 59 &&
+        rtc->minutes <= 59 &&
+        rtc->hours <= 23 &&
+        rtc->day >= 1 && rtc->day <= 7 &&
+        rtc->date >= 1 && rtc->date <= 31 &&
+        rtc->month >= 1 && rtc->month <= 12;
+}
+
+static bool grow_light_dwell_elapsed(uint32_t seconds)
+{
+    if (grow_light_last_change_us == 0) return true;
+
+    int64_t elapsed_us = esp_timer_get_time() - grow_light_last_change_us;
+    return elapsed_us >= (int64_t)seconds * 1000000LL;
+}
+
+static void grow_light_set_local(bool on, const char *reason)
+{
+    bool current = phase20_grow_light_get();
+    if (current == on) return;
+
+    esp_err_t err = phase20_grow_light_set(on);
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Grow light could not turn %s: %s",
+            on ? "ON" : "OFF",
+            esp_err_to_name(err)
+        );
+        return;
+    }
+
+    grow_light_last_change_us = esp_timer_get_time();
+
+    ESP_LOGI(
+        TAG,
+        "Grow light: %s (%s)",
+        on ? "ON" : "OFF",
+        reason != NULL ? reason : "local policy"
+    );
+}
+
+static void grow_light_apply_local_policy(
+    bool light_valid,
+    float lux,
+    bool rtc_valid,
+    const rtc_time_t *rtc
+)
+{
+    if (
+        ota_manager_update_in_progress() ||
+        setup_blocks_normal_cloud_traffic()
+    ) {
+        grow_light_set_local(false, "setup/OTA safety");
+        return;
+    }
+
+    if (!rtc_valid || !rtc_calendar_valid(rtc)) {
+        grow_light_set_local(false, "RTC unavailable");
+        return;
+    }
+
+    /*
+     * A timed authenticated grow-light ON command owns the actuator until its
+     * local auto-off timer expires. Do not let sensor automation race it.
+     */
+    if (floraos_phase20_grow_light_override_active()) {
+        return;
+    }
+
+    bool in_photoperiod =
+        rtc->hours >= GROW_LIGHT_START_HOUR &&
+        rtc->hours < GROW_LIGHT_END_HOUR;
+
+    if (!in_photoperiod) {
+        grow_light_set_local(false, "outside RTC photoperiod");
+        return;
+    }
+
+    if (!light_valid) {
+        /*
+         * Fail closed on a fresh boot. If the light was already ON, keep its
+         * current state until the RTC reaches the hard END_HOUR.
+         */
+        return;
+    }
+
+    bool current = phase20_grow_light_get();
+
+    if (
+        !current &&
+        lux < GROW_LIGHT_ON_BELOW_LUX &&
+        grow_light_dwell_elapsed(GROW_LIGHT_MIN_OFF_SECONDS)
+    ) {
+        grow_light_set_local(true, "BH1750 below daylight threshold");
+        return;
+    }
+
+    if (
+        current &&
+        lux >= GROW_LIGHT_OFF_ABOVE_LUX &&
+        grow_light_dwell_elapsed(GROW_LIGHT_MIN_ON_SECONDS)
+    ) {
+        grow_light_set_local(false, "BH1750 detected strong daylight");
+    }
+}
+
+static uint32_t fertilizer_date_key(const rtc_time_t *rtc)
+{
+    return
+        (uint32_t)rtc->year * 10000U +
+        (uint32_t)rtc->month * 100U +
+        (uint32_t)rtc->date;
+}
+
+static void fertilizer_auto_off(void *argument)
+{
+    (void)argument;
+
+    (void)phase20_fertilizer_set(false);
+    ESP_LOGI(TAG, "Peristaltic pump: OFF (scheduled dose complete)");
+}
+
+static esp_err_t fertilizer_automation_init(void)
+{
+    esp_timer_create_args_t timer_args = {
+        .callback = fertilizer_auto_off,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "fert_auto_off",
+        .skip_unhandled_events = true
+    };
+
+    esp_err_t err = esp_timer_create(&timer_args, &fertilizer_timer);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(
+        FERTILIZER_NVS_NAMESPACE,
+        NVS_READWRITE,
+        &fertilizer_nvs
+    );
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    fertilizer_nvs_open = true;
+    return ESP_OK;
+}
+
+static bool fertilizer_already_dosed_today(const rtc_time_t *rtc)
+{
+    if (!fertilizer_nvs_open || rtc == NULL) return true;
+
+    uint32_t last_date = 0;
+    esp_err_t err = nvs_get_u32(
+        fertilizer_nvs,
+        FERTILIZER_NVS_LAST_DATE_KEY,
+        &last_date
+    );
+
+    if (err == ESP_ERR_NVS_NOT_FOUND) return false;
+    if (err != ESP_OK) return true;
+
+    return last_date == fertilizer_date_key(rtc);
+}
+
+static bool fertilizer_mark_dosed_today(const rtc_time_t *rtc)
+{
+    if (!fertilizer_nvs_open || rtc == NULL) return false;
+
+    esp_err_t err = nvs_set_u32(
+        fertilizer_nvs,
+        FERTILIZER_NVS_LAST_DATE_KEY,
+        fertilizer_date_key(rtc)
+    );
+    if (err != ESP_OK) return false;
+
+    return nvs_commit(fertilizer_nvs) == ESP_OK;
+}
+
+static void fertilizer_apply_local_schedule(
+    bool rtc_valid,
+    const rtc_time_t *rtc
+)
+{
+    if (
+        !rtc_valid ||
+        !rtc_calendar_valid(rtc) ||
+        !fertilizer_nvs_open ||
+        fertilizer_timer == NULL
+    ) {
+        return;
+    }
+
+    if (
+        ota_manager_update_in_progress() ||
+        setup_blocks_normal_cloud_traffic()
+    ) {
+        if (esp_timer_is_active(fertilizer_timer)) {
+            (void)esp_timer_stop(fertilizer_timer);
+        }
+        (void)phase20_fertilizer_set(false);
+        return;
+    }
+
+    if (esp_timer_is_active(fertilizer_timer)) {
+        return;
+    }
+
+    if (rtc->day != FERTILIZER_DAY_OF_WEEK) {
+        return;
+    }
+
+    int now_minutes =
+        (int)rtc->hours * 60 +
+        (int)rtc->minutes;
+
+    int scheduled_minutes =
+        FERTILIZER_HOUR * 60 +
+        FERTILIZER_MINUTE;
+
+    if (
+        now_minutes < scheduled_minutes ||
+        now_minutes >= scheduled_minutes + FERTILIZER_WINDOW_MINUTES
+    ) {
+        return;
+    }
+
+    if (fertilizer_already_dosed_today(rtc)) {
+        return;
+    }
+
+    /*
+     * Persist first: if power fails after the pump starts, this date will not
+     * be dosed again after reboot. Fail-closed is safer than double dosing.
+     */
+    if (!fertilizer_mark_dosed_today(rtc)) {
+        ESP_LOGW(TAG, "Fertilizer dose skipped: could not persist dose date");
+        return;
+    }
+
+    esp_err_t err = phase20_fertilizer_set(true);
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Peristaltic pump could not start: %s",
+            esp_err_to_name(err)
+        );
+        return;
+    }
+
+    err = esp_timer_start_once(
+        fertilizer_timer,
+        (uint64_t)FERTILIZER_RUN_MS * 1000ULL
+    );
+
+    if (err != ESP_OK) {
+        (void)phase20_fertilizer_set(false);
+        ESP_LOGW(
+            TAG,
+            "Peristaltic pump timer failed: %s",
+            esp_err_to_name(err)
+        );
+        return;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Peristaltic pump: ON for %d ms (weekly RTC dose)",
+        FERTILIZER_RUN_MS
+    );
 }
 
 static bool setup_blocks_normal_cloud_traffic(void)
@@ -715,23 +1061,26 @@ void app_main(void)
     if (boot_mode == FLORACORE_MODE_NORMAL) {
         water_pump_init();
         peristaltic_pump_init();
-
-#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
         grow_light_init();
-#endif
+
+        esp_err_t fertilizer_init_err = fertilizer_automation_init();
+        if (fertilizer_init_err != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "Fertilizer automation disabled: %s",
+                esp_err_to_name(fertilizer_init_err)
+            );
+        }
 
         floraos_phase20_ops_t phase20_ops = {
             .setup_blocked = setup_blocks_normal_cloud_traffic,
             .ota_in_progress = ota_manager_update_in_progress,
             .water_set = phase20_water_set,
             .water_get = phase20_water_get,
-#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
             .grow_light_set = phase20_grow_light_set,
-            .grow_light_get = phase20_grow_light_get
-#else
-            .grow_light_set = NULL,
-            .grow_light_get = NULL
-#endif
+            .grow_light_get = phase20_grow_light_get,
+            .fertilizer_set = phase20_fertilizer_set,
+            .fertilizer_get = phase20_fertilizer_get
         };
 
         esp_err_t phase20_err = floraos_phase20_init(&phase20_ops);
@@ -1026,6 +1375,18 @@ void app_main(void)
             );
         }
 
+        grow_light_apply_local_policy(
+            light_valid,
+            average_lux,
+            rtc_valid,
+            &rtc
+        );
+
+        fertilizer_apply_local_schedule(
+            rtc_valid,
+            &rtc
+        );
+
         pump_for_cloud = phase20_water_get();
 
         bool cloud_ready = floraos_cloud_housekeeping(
@@ -1101,13 +1462,10 @@ void app_main(void)
                 .light_valid = light_valid,
                 .light_lux = average_lux,
                 .pump_on = pump_for_cloud,
-#ifdef CONFIG_FLORACORE_GROW_LIGHT_ENABLE
                 .grow_light_valid = true,
                 .grow_light_on = phase20_grow_light_get(),
-#else
-                .grow_light_valid = false,
-                .grow_light_on = false,
-#endif
+                .fertilizer_pump_valid = true,
+                .fertilizer_pump_on = phase20_fertilizer_get(),
                 .rtc_valid = rtc_valid,
                 .rtc_text = {0}
             };
