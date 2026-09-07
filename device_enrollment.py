@@ -161,15 +161,40 @@ def user_has_devices(user_id: int) -> bool:
 
 def owned_devices(user_id: int) -> list[dict[str, Any]]:
     with _connect() as db:
-        rows = db.execute(
+        # Online/offline status is intentionally heartbeat-specific. A recent
+        # telemetry, claim, command-result, or OTA-status message can update
+        # device_state.last_seen, but must not make the device appear online.
+        #
+        # Keep compatibility with enrollment-only tests/databases that may be
+        # initialized before the device API creates device_messages.
+        has_device_messages = db.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='device_messages' LIMIT 1"
+        ).fetchone() is not None
+
+        heartbeat_expr = (
             """
+            (
+                SELECT MAX(m.received_at)
+                FROM device_messages AS m
+                WHERE m.device_id = o.device_id
+                  AND m.message_type = 'heartbeat'
+            ) AS last_heartbeat_at
+            """
+            if has_device_messages
+            else "NULL AS last_heartbeat_at"
+        )
+
+        rows = db.execute(
+            f"""
             SELECT
                 o.device_id,
                 o.claimed_at,
                 o.nickname,
                 s.last_seen,
                 s.last_message_type,
-                s.last_message_id
+                s.last_message_id,
+                {heartbeat_expr}
             FROM device_ownership AS o
             LEFT JOIN device_state AS s ON s.device_id = o.device_id
             WHERE o.user_id = ?
@@ -186,6 +211,7 @@ def owned_devices(user_id: int) -> list[dict[str, Any]]:
             "last_seen": row["last_seen"],
             "last_message_type": row["last_message_type"],
             "last_message_id": row["last_message_id"],
+            "last_heartbeat_at": row["last_heartbeat_at"],
         }
         for row in rows
     ]
