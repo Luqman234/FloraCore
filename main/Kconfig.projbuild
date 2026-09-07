@@ -34,20 +34,15 @@ endmenu
 menu "FloraCore Phase 20 hardware"
 
 config FLORACORE_GROW_LIGHT_ENABLE
-    bool "Enable grow-light actuator + command support"
+    bool "Enable authenticated cloud grow-light command support"
     default n
     help
-        Keep this disabled until a real grow-light MOSFET/driver is wired and
-        verified. When disabled, FloraCore truthfully reports grow_light=false
-        and grow_light command support=0.
+        The physical grow light is fixed to GPIO1 and can be controlled locally
+        by the RTC + BH1750 automation in main.c regardless of this setting.
 
-config FLORACORE_GROW_LIGHT_GPIO
-    int "Grow-light MOSFET control GPIO"
-    depends on FLORACORE_GROW_LIGHT_ENABLE
-    range 1 48
-    default 41
-    help
-        ESP32-S3 GPIO connected to the 3.3 V-compatible grow-light driver.
-        Verify the physical board wiring before enabling this feature.
+        Enable this only when you also want Phase 20 to advertise and accept
+        authenticated timed grow_light commands from FloraOS. When disabled,
+        the actuator can still operate locally, but cloud grow_light command
+        support remains 0.
 
 endmenu
