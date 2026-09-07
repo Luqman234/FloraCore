@@ -121,6 +121,9 @@ typedef struct
     uint8_t year;
 } rtc_time_t;
 
+/* Used by local actuator policy helpers declared before its definition. */
+static bool setup_blocks_normal_cloud_traffic(void);
+
 static uint8_t bcd_to_decimal(uint8_t bcd)
 {
     return ((bcd >> 4) * 10) + (bcd & 0x0F);
