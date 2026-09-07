@@ -192,7 +192,10 @@ def init_turnstile(app) -> None:
             return redirect("/")
 
         if _entry_gate_verified():
-            return redirect(_safe_entry_next(request.args.get("next")))
+            next_url = _safe_entry_next(request.args.get("next"))
+            if next_url == "/":
+                session["turnstile_root_bypass_once"] = True
+            return redirect(next_url)
 
         response = current_app.make_response(
             render_template(
