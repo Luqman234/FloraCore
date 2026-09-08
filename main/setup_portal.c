@@ -614,18 +614,67 @@ static void dns_server_task(void *parameter)
         response[7] = 0x01;
         response[8] = response[9] = response[10] = response[11] = 0;
 
-        int pos = 12;
-        while (pos < len && request[pos] != 0) {
-            int label = request[pos];
-            pos += label + 1;
-        }
-        pos++;
-
-        if (pos + 4 > len || pos + 16 > (int)sizeof(response)) {
+        /*
+         * Parse exactly one ordinary DNS question defensively.
+         *
+         * A DNS label is at most 63 bytes. Compression pointers are legal in
+         * some DNS fields, but are unnecessary for captive-portal queries and
+         * make this tiny responder substantially harder to reason about, so
+         * reject them here instead of trying to follow attacker-controlled
+         * offsets.
+         *
+         * Keep every bounds check relative to the bytes that will actually be
+         * consumed. The previous check reserved only the 16-byte answer, then
+         * advanced over the 4-byte QTYPE/QCLASS first, allowing a four-byte
+         * write past response[512] for a crafted question.
+         */
+        if (request[4] != 0x00 || request[5] != 0x01) {
             continue;
         }
 
+        size_t pos = 12;
+        const size_t packet_len = (size_t)len;
+        bool question_name_ok = false;
+
+        while (pos < packet_len) {
+            const uint8_t label_len = request[pos];
+
+            if (label_len == 0) {
+                pos++;
+                question_name_ok = true;
+                break;
+            }
+
+            if (
+                label_len > 63 ||
+                (label_len & 0xC0U) != 0 ||
+                (size_t)label_len > packet_len - pos - 1
+            ) {
+                question_name_ok = false;
+                break;
+            }
+
+            pos += (size_t)label_len + 1;
+        }
+
+        if (!question_name_ok) {
+            continue;
+        }
+
+        /* QTYPE + QCLASS must be fully present in the received packet. */
+        if (packet_len - pos < 4) {
+            continue;
+        }
         pos += 4;
+
+        /*
+         * The answer below is exactly 16 bytes. Check after consuming the
+         * question fields so response writes can never cross the 512-byte
+         * stack buffer.
+         */
+        if (pos > sizeof(response) - 16) {
+            continue;
+        }
 
         response[pos++] = 0xC0;
         response[pos++] = 0x0C;
