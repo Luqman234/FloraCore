@@ -1,0 +1,94 @@
+name: FloraCore CI
+
+on:
+  push:
+    branches:
+      - main
+      - monorepo-migration
+  pull_request:
+    branches:
+      - main
+      - monorepo-migration
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: floracore-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: FloraOS Web
+    runs-on: ubuntu-latest
+
+    env:
+      PYTHONPATH: web
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: web/requirements.txt
+
+      - name: Install FloraOS Web dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r web/requirements.txt
+          python -m pip check
+
+      - name: Compile FloraOS Web source
+        run: |
+          python -m compileall -q web
+
+      - name: Run FloraOS Web regression suite
+        run: |
+          python -m unittest discover \
+            -s web/tests \
+            -p 'test_*.py' \
+            -v
+
+      - name: Run FloraCore preflight
+        run: |
+          python web/scripts/floracore_preflight.py
+
+      - name: Verify no legacy absolute paths remain
+        shell: bash
+        run: |
+          if grep -RInE \
+            '/home/Luqman/website|/home/Luqman/ESP32_Project/FloraCore(_git)?' \
+            web tools .github docs \
+            --exclude-dir=__pycache__; then
+            echo "Legacy machine-specific FloraCore path detected."
+            exit 1
+          fi
+
+      - name: Validate website publisher safely
+        run: |
+          python web/publish_floraos_website_branch.py --dry-run
+
+  firmware:
+    name: FloraOS Firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install ESP-IDF 6.0.2
+        uses: espressif/install-esp-idf-action@v1
+        with:
+          version: "v6.0.2"
+
+      - name: Show ESP-IDF version
+        run: idf.py --version
+
+      - name: Build FloraOS
+        working-directory: firmware
+        run: idf.py build
