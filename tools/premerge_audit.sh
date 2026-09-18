@@ -753,7 +753,8 @@ fi
 
 section "10. Portability audit"
 
-LEGACY_PATTERN='/home/Luqman/website|/home/Luqman/ESP32_Project/FloraCore(_git)?'
+LEGACY_HOME="/home/Luqman"
+LEGACY_PATTERN="${LEGACY_HOME}/website|${LEGACY_HOME}/ESP32_Project/FloraCore(_git)?"
 
 if grep -RInE "$LEGACY_PATTERN" \
     web \
