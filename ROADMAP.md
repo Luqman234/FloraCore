@@ -68,7 +68,7 @@ All physical actions must continue to pass through the same command-validation a
 ## Phase 7 — Ecosystem growth
 
 - versioned releases
-- migration toward a cleaner repository layout
+- complete and stabilize the monorepo migration
 - expanded documentation
 - contributor onboarding
 - external testing by users who did not build FloraCore

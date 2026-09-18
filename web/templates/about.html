@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07111F" />
+  <meta name="description" content="About FloraCore — the mission, philosophy, architecture, and open-source plans behind FloraCore and FloraOS." />
+  <title>About FloraCore — Built around something alive.</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/site.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/about.css') }}" />
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='icons/favicon.svg') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/favicon-32x32.png') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="64x64" href="{{ url_for('static', filename='icons/favicon-64x64.png') }}?v=20260901">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='icons/favicon.ico') }}?v=20260901">
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='icons/apple-touch-icon.png') }}?v=20260901">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+
+  <header class="site-header" id="siteHeader">
+    <nav class="nav-shell" aria-label="About navigation">
+      <a class="brand" href="https://floraos.life" aria-label="FloraCore home">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+        <span class="brand-word">FloraCore</span>
+      </a>
+
+      <div class="desktop-nav">
+        <div class="nav-links">
+          <a href="https://floraos.life">Main Site</a>
+          <a href="https://floraos.life/docs">Docs</a>
+        </div>
+        <div class="nav-actions">
+          <a class="text-link" href="https://floraos.life/login">Sign in</a>
+          <a class="btn btn-primary btn-sm" href="https://floraos.life/dashboard">Open Dashboard</a>
+        </div>
+      </div>
+    </nav>
+  </header>
+
+  <main id="main-content">
+    <!-- ABOUT FLORACORE -->
+    <section class="about-section section-shell" id="vision" aria-labelledby="about-title">
+      <div class="about-rule">
+        <span>FLORACORE / ABOUT</span>
+        <span>BUILT AROUND SOMETHING ALIVE</span>
+      </div>
+
+      <div class="about-hero">
+        <span class="eyebrow">ABOUT FLORACORE</span>
+        <h2 id="about-title">Growing plants shouldn’t have to be guesswork.</h2>
+        <p class="about-lede">
+          FloraCore began with a simple idea: what if plant care could be more intelligent,
+          more reliable, and easier to understand?
+        </p>
+      </div>
+
+      <div class="about-story-grid">
+        <article class="about-story about-story-wide">
+          <span class="about-index">01 / WHY</span>
+          <h3>Plants are always telling us something.</h3>
+          <p>
+            Plants constantly respond to their environment—soil moisture, light, water,
+            time, temperature, and countless small changes. Yet most of us still care for
+            them by guessing when something looks wrong.
+          </p>
+          <p>
+            FloraCore is our attempt to change that. We’re building a connected plant-care
+            platform that combines sensors, automation, embedded hardware, and software
+            into one system designed to understand what is happening around a plant and
+            help people respond to it.
+          </p>
+        </article>
+
+        <article class="about-story">
+          <span class="about-index">02 / SYSTEM</span>
+          <h3>Hardware meets FloraOS.</h3>
+          <p>
+            FloraCore is the physical system interacting with the plant and its environment.
+            FloraOS is the software layer that turns those measurements and devices into
+            monitoring, automation, insights, and integrations.
+          </p>
+
+          <div class="about-flow" aria-label="FloraCore system flow">
+            <span>PLANT</span><i>↓</i>
+            <span>SENSORS</span><i>↓</i>
+            <span>FLORACORE</span><i>↓</i>
+            <span>FLORAOS</span>
+          </div>
+
+          <p class="about-accent">
+            The goal is not simply to create a flower pot filled with electronics.
+            The goal is to build a platform for connected plant care.
+          </p>
+        </article>
+      </div>
+
+      <div class="about-dual">
+        <article class="about-panel">
+          <span class="about-index">03 / PHILOSOPHY</span>
+          <h3>Automation without losing control.</h3>
+          <p>
+            We believe good automation should remove repetitive work without removing the
+            human from the process.
+          </p>
+          <p>
+            FloraCore should handle the things machines are good at—monitoring continuously,
+            reacting consistently, keeping records, and noticing patterns—while leaving
+            meaningful decisions in the hands of the person growing the plant.
+          </p>
+          <p>
+            Instead of hiding everything behind a mysterious algorithm, FloraOS should make
+            information understandable. You should be able to see what your plant is
+            experiencing, what FloraCore is doing, and why.
+          </p>
+        </article>
+
+        <article class="about-panel">
+          <span class="about-index">04 / FOUNDATION</span>
+          <h3>Built as a real system.</h3>
+          <p>
+            FloraCore is designed as more than a standalone prototype. The hardware,
+            FloraOS backend, account system, secure device communication, telemetry storage,
+            and developer API are being developed as parts of one connected architecture.
+          </p>
+          <p>
+            The physical FloraCore authenticates itself securely to FloraOS, while users
+            and applications interact through a separate account and API layer. That
+            separation lets the platform grow without sacrificing the security boundary
+            around the physical device.
+          </p>
+        </article>
+      </div>
+
+      <article class="about-open">
+        <div>
+          <span class="about-index">05 / OPEN DEVELOPMENT</span>
+          <h3>Designed to be open.</h3>
+        </div>
+        <div class="about-open-copy">
+          <p>
+            We don’t want FloraCore to become a closed box that only works with one website.
+            FloraOS is being designed so developers, researchers, makers, and users can
+            understand how it works, build on top of it, and create their own integrations.
+          </p>
+          <p>
+            Through the FloraOS Developer API, authorized applications can access device
+            information, telemetry, plant profiles, and other account-owned resources
+            without exposing the private credentials used to authenticate the physical
+            FloraCore itself.
+          </p>
+          <p>
+            As the project matures, <strong>we plan to publicly release FloraCore and
+            FloraOS as open-source software under the GNU AGPL/GPL family of licenses.</strong>
+          </p>
+          <p>
+            We want people to be able to study the system, modify it, improve it, self-host
+            parts of it, and build new ideas on top of what we create. The copyleft
+            principles of the AGPL and GPL can help keep improvements to the open project
+            available to the wider community.
+          </p>
+          <p class="about-accent">
+            Our intention is for FloraCore to grow not only as a product, but as an open
+            platform that other people can learn from and contribute to.
+          </p>
+        </div>
+      </article>
+
+      <div class="about-principles">
+        <div class="section-heading">
+          <span class="eyebrow">OUR PRINCIPLES</span>
+          <h2>What we build around.</h2>
+        </div>
+
+        <div class="about-principle-grid">
+          <article>
+            <span>01</span>
+            <h3>Useful automation.</h3>
+            <p>Technology should solve an actual problem instead of existing simply because it can.</p>
+          </article>
+          <article>
+            <span>02</span>
+            <h3>Understandable data.</h3>
+            <p>Measurements should help people understand their plants rather than overwhelm them with numbers.</p>
+          </article>
+          <article>
+            <span>03</span>
+            <h3>Security by separation.</h3>
+            <p>Hardware identity, user identity, ownership, and application access should remain distinct.</p>
+          </article>
+          <article>
+            <span>04</span>
+            <h3>Room to grow.</h3>
+            <p>FloraCore should evolve as new sensors, software capabilities, integrations, and ideas emerge.</p>
+          </article>
+        </div>
+      </div>
+
+      <div class="about-future">
+        <span class="about-index">06 / WHAT COMES NEXT</span>
+        <h2>We’re still building.</h2>
+        <p>
+          What exists today is only the foundation. Our long-term vision is to create a
+          secure, open platform for connected plant care—one that can be used, studied,
+          modified, extended, and improved by the people who build with it.
+        </p>
+        <div class="about-future-lines" aria-label="FloraCore goals">
+          <span>Better sensing.</span>
+          <span>Better automation.</span>
+          <span>Better software.</span>
+          <span>Open development.</span>
+          <span>And, hopefully, healthier plants.</span>
+        </div>
+        <div class="about-signoff">
+          <strong>This is FloraCore.</strong>
+          <span>Technology built around something alive — and built to be shared.</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="section-shell footer-grid">
+      <div>
+        <a class="brand" href="https://floraos.life">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+          <span class="brand-word">FloraCore</span>
+        </a>
+        <p>One core. Every system.</p>
+      </div>
+      <nav class="footer-links" aria-label="Footer navigation">
+        <a href="https://floraos.life">Main site</a>
+        <a href="https://floraos.life/docs">Docs</a>
+        <a href="https://floraos.life/login">Sign in</a>
+        <a href="https://floraos.life/dashboard">Dashboard</a>
+      </nav>
+    </div>
+    <div class="section-shell footer-bottom">
+      <span>© 2026 FloraCore</span>
+      <span>ABOUT / OPEN DEVELOPMENT</span>
+    </div>
+  </footer>
+</body>
+</html>

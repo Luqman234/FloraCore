@@ -1,0 +1,47 @@
+.flora-turnstile-wrap {
+  margin: 12px 0 10px;
+}
+
+.flora-turnstile {
+  width: 100%;
+  min-height: 0;
+}
+
+.flora-turnstile-status {
+  min-height: 16px;
+  margin-top: 5px;
+  color: #6F8495;
+  font: 700 .54rem/1.35 ui-monospace, monospace;
+  letter-spacing: .025em;
+}
+
+.flora-turnstile-status:empty {
+  display: none;
+}
+
+.flora-turnstile-status.error {
+  color: #FF8E8E;
+}
+
+.flora-turnstile-status.muted {
+  color: #7F95A6;
+}
+
+.flora-turnstile-caption {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+  color: #5F7486;
+  font: 700 .49rem/1.3 ui-monospace, monospace;
+  letter-spacing: .035em;
+}
+
+.flora-turnstile-caption::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #76A3B2;
+  box-shadow: 0 0 0 3px rgba(118,163,178,.07);
+}

@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07111F" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
+  <title>Automations — FloraCore</title>
+
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='icons/favicon.svg') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/favicon-32x32.png') }}?v=20260901">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='icons/favicon.ico') }}?v=20260901">
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}?v=20260901-cleanbar3" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/automations.css') }}?v=20260901-cleanbar3" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="FloraCore home">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span>Device</span>
+    </a>
+    <div class="topbar-meta">
+      <span class="automation-mode-badge"><i></i>ADVANCED</span>
+      <span class="user-id-badge">USER ID {{ user_id }}</span>
+      <span>{{ user_email }}</span>
+      <a class="topbar-button" href="/dashboard">Dashboard</a>
+    </div>
+  </header>
+
+  <main class="automation-shell">
+    <aside class="sidebar automation-sidebar" aria-label="FloraOS navigation">
+      <span class="side-label">WORKSPACE</span>
+      <a href="/dashboard">Overview</a>
+      <a href="/plants">Plants</a>
+      <a class="active" href="/automations">Automations</a>
+      <a href="/notifications">Notifications</a>
+      <a href="/automations/v2">Automation v2</a>
+      <a href="/settings">Settings</a>
+
+      <span class="side-label second">DEVELOPER</span>
+      <a href="/settings/developer">Developer API</a>
+      <a href="/docs">Documentation</a>
+
+      <span class="side-label second">LINK</span>
+      <a class="connect-link" href="/connect"><span aria-hidden="true">↗</span>Connect</a>
+
+      <div class="automation-engine-note">
+        <span>ENGINE</span>
+        <b>Automations v1</b>
+      </div>
+    </aside>
+
+    <section class="automation-workspace">
+      <div class="automation-heading">
+        <div class="automation-heading-copy">
+          <span class="eyebrow">ADVANCED CONTROL</span>
+          <h1>Automation Studio</h1>
+          <p>Build and test validated sensor-to-action flows for your FloraCore.</p>
+        </div>
+        <div class="automation-security-chip">
+          <span>VALIDATED PATH</span>
+          <b>Graph → Queue → AES-GCM → FloraCore</b>
+        </div>
+      </div>
+
+      <section class="automation-toolbar automation-toolbar-clean" aria-label="Automation controls">
+        <div class="toolbar-primary">
+          <label class="toolbar-field toolbar-name">
+            <span>Name</span>
+            <input id="automationName" maxlength="80" placeholder="Water dry peppermint" autocomplete="off" />
+          </label>
+
+          <label class="toolbar-field toolbar-device">
+            <span>Device</span>
+            <select id="deviceSelect"></select>
+          </label>
+
+          <label class="toolbar-field toolbar-timezone">
+            <span>Timezone</span>
+            <input id="timezoneInput" maxlength="80" placeholder="Asia/Kuala_Lumpur" autocomplete="off" />
+          </label>
+        </div>
+
+        <div class="toolbar-command-area">
+          <span class="save-state-pill" id="saveState">NEW AUTOMATION</span>
+          <button class="studio-button secondary" id="saveAutomationButton" type="button">Save</button>
+          <button class="studio-button primary" id="enableAutomationButton" type="button" disabled>Enable</button>
+        </div>
+
+        <span class="toolbar-feedback" id="editorMessage" role="status" aria-live="polite"></span>
+      </section>
+
+      <section class="studio-layout">
+        <aside class="studio-left">
+          <div class="studio-panel automation-list-panel">
+            <div class="studio-panel-head saved-flows-head">
+              <span>SAVED FLOWS</span>
+              <div class="saved-flow-actions">
+                <b id="automationCount">0</b>
+                <button class="mini-tool-button" id="newAutomationButton" type="button" title="New automation" aria-label="New automation">+</button>
+                <button class="mini-tool-button danger" id="deleteAutomationButton" type="button" title="Delete automation" aria-label="Delete automation" hidden>×</button>
+              </div>
+            </div>
+            <div class="automation-list" id="automationList">
+              <p class="studio-empty">No automations yet.</p>
+            </div>
+          </div>
+
+          <div class="studio-panel block-library">
+            <div class="studio-panel-head">
+              <span>BLOCK LIBRARY</span>
+              <small>Drag onto canvas</small>
+            </div>
+
+            <div class="block-group">
+              <b>TRIGGERS</b>
+              <button class="palette-block trigger" draggable="true" data-node-type="trigger_soil_below" type="button">
+                <i></i><span>Soil below</span><small>soil % threshold</small>
+              </button>
+              <button class="palette-block trigger" draggable="true" data-node-type="trigger_soil_above" type="button">
+                <i></i><span>Soil above</span><small>soil % threshold</small>
+              </button>
+              <button class="palette-block trigger" draggable="true" data-node-type="trigger_light_below" type="button">
+                <i></i><span>Light below</span><small>lux threshold</small>
+              </button>
+              <button class="palette-block trigger" draggable="true" data-node-type="trigger_light_above" type="button">
+                <i></i><span>Light above</span><small>lux threshold</small>
+              </button>
+              <button class="palette-block trigger" draggable="true" data-node-type="trigger_schedule" type="button">
+                <i></i><span>Schedule</span><small>daily local time</small>
+              </button>
+              <button class="palette-block trigger" draggable="true" data-node-type="trigger_telemetry" type="button">
+                <i></i><span>Telemetry</span><small>new sensor sample</small>
+              </button>
+            </div>
+
+            <div class="block-group">
+              <b>CONDITIONS</b>
+              <button class="palette-block condition" draggable="true" data-node-type="condition_soil_below" type="button">
+                <i></i><span>Soil below</span><small>continue if true</small>
+              </button>
+              <button class="palette-block condition" draggable="true" data-node-type="condition_light_below" type="button">
+                <i></i><span>Light below</span><small>continue if true</small>
+              </button>
+              <button class="palette-block condition" draggable="true" data-node-type="condition_time_between" type="button">
+                <i></i><span>Time window</span><small>continue in range</small>
+              </button>
+            </div>
+
+            <div class="block-group">
+              <b>FLOW</b>
+              <button class="palette-block flow" draggable="true" data-node-type="cooldown" type="button">
+                <i></i><span>Cooldown</span><small>rate-limit runs</small>
+              </button>
+            </div>
+
+            <div class="block-group">
+              <b>ACTIONS</b>
+              <button class="palette-block action" draggable="true" data-node-type="action_water" type="button">
+                <i></i><span>Water</span><small>bounded pump run</small>
+              </button>
+              <button class="palette-block action" draggable="true" data-node-type="action_grow_light" type="button">
+                <i></i><span>Grow light</span><small>timed on / off</small>
+              </button>
+            </div>
+          </div>
+        </aside>
+
+        <section class="studio-panel canvas-panel">
+          <div class="canvas-head">
+            <div>
+              <span>FLOW CANVAS</span>
+              <small>Drag blocks · connect output → input.</small>
+            </div>
+            <div class="canvas-actions">
+              <button class="canvas-test-button" id="simulateAutomationButton" type="button">Test</button>
+              <span class="canvas-action-divider" aria-hidden="true"></span>
+              <button id="fitCanvasButton" type="button">Arrange</button>
+              <button id="clearCanvasButton" type="button">Clear</button>
+            </div>
+          </div>
+
+          <div class="automation-canvas" id="automationCanvas" tabindex="0">
+            <svg class="edge-layer" id="edgeLayer" aria-hidden="true"></svg>
+            <div class="canvas-empty" id="canvasEmpty">
+              <span class="canvas-empty-mark" aria-hidden="true">◇</span>
+              <b>Build your first flow</b>
+              <p>Start with one trigger, add optional conditions or a cooldown, then finish with one action.</p>
+            </div>
+          </div>
+
+          <div class="canvas-legend">
+            <span><i class="legend-trigger"></i>Trigger</span>
+            <span><i class="legend-condition"></i>Condition</span>
+            <span><i class="legend-flow"></i>Flow</span>
+            <span><i class="legend-action"></i>Action</span>
+          </div>
+        </section>
+
+        <aside class="studio-panel inspector-panel">
+          <div class="studio-panel-head">
+            <span>INSPECTOR</span>
+            <small id="selectedNodeType">No block selected</small>
+          </div>
+
+          <div class="inspector-empty" id="inspectorEmpty">
+            <span>SELECT A BLOCK</span>
+            <p>Choose a canvas block to edit its threshold, time, duration, or safety cooldown.</p>
+          </div>
+
+          <form class="node-inspector" id="nodeInspector" hidden>
+            <div id="inspectorFields"></div>
+            <div class="inspector-actions">
+              <button class="danger-text" id="deleteNodeButton" type="button">Delete block</button>
+            </div>
+          </form>
+
+          <div class="safety-floor">
+            <span>SERVER SAFETY FLOOR</span>
+            <dl>
+              <div><dt>Water automation</dt><dd>≥ 15 min</dd></div>
+              <div><dt>Light automation</dt><dd>≥ 5 min</dd></div>
+              <div><dt>Water command</dt><dd>0.5–30 s</dd></div>
+            </dl>
+            <p>FloraCore firmware must still enforce equal or stricter local hardware limits.</p>
+          </div>
+        </aside>
+      </section>
+
+      <section class="studio-panel run-history-panel">
+        <div class="studio-panel-head">
+          <span>RUN HISTORY</span>
+          <small id="runHistoryLabel">Select a saved automation</small>
+        </div>
+        <div id="runHistory" class="run-history">
+          <p class="studio-empty">No run history to display.</p>
+        </div>
+      </section>
+    </section>
+  </main>
+
+
+  <div class="automation-modal simulation-modal" id="simulationModal" hidden>
+    <section class="automation-modal-card simulation-card" role="dialog" aria-modal="true" aria-labelledby="simulationModalTitle">
+      <div class="simulation-modal-head">
+        <div>
+          <span class="modal-kicker">SIMULATION / ZERO HARDWARE I/O</span>
+          <h2 id="simulationModalTitle">Test this flow</h2>
+          <p>Run the graph without queuing a command. FloraOS will show exactly where the flow passes, stops, or would be blocked by current device safety state.</p>
+        </div>
+        <span class="dry-run-chip">DRY RUN</span>
+      </div>
+
+      <div class="simulation-source-grid">
+        <label class="inspector-field">
+          <span>INPUT SOURCE</span>
+          <select id="simulationSource">
+            <option value="latest">Latest real telemetry</option>
+            <option value="custom">Custom test values</option>
+          </select>
+        </label>
+
+        <div class="simulation-source-note" id="simulationSourceNote">
+          Reads the latest authenticated telemetry already stored by FloraOS. Nothing is sent to the device.
+        </div>
+      </div>
+
+      <div class="simulation-input-grid" id="simulationInputGrid">
+        <label class="inspector-field">
+          <span>SOIL MOISTURE (%)</span>
+          <input id="simulationSoil" type="number" min="0" max="100" step="1" value="28" disabled>
+        </label>
+
+        <label class="inspector-field">
+          <span>LIGHT (LUX)</span>
+          <input id="simulationLight" type="number" min="0" max="250000" step="1" value="4200" disabled>
+        </label>
+
+        <label class="inspector-field">
+          <span>LOCAL TIME</span>
+          <input id="simulationTime" type="time" disabled>
+        </label>
+      </div>
+
+      <div class="simulation-result" id="simulationResult" hidden>
+        <div class="simulation-outcome">
+          <div>
+            <span id="simulationOutcomeBadge">DRY RUN</span>
+            <h3 id="simulationOutcomeTitle">Simulation complete</h3>
+            <p id="simulationOutcomeText">No hardware command was queued.</p>
+          </div>
+          <div class="simulation-snapshot">
+            <span><b id="simulationSoilResult">—</b><small>SOIL</small></span>
+            <span><b id="simulationLightResult">—</b><small>LIGHT</small></span>
+            <span><b id="simulationTimeResult">—</b><small>TIME</small></span>
+          </div>
+        </div>
+
+        <div class="simulation-action-preview" id="simulationActionPreview" hidden>
+          <span>ACTION PREVIEW</span>
+          <b id="simulationActionText">—</b>
+          <small id="simulationDeliveryText">—</small>
+        </div>
+
+        <div class="simulation-steps">
+          <span>FLOW TRACE</span>
+          <div id="simulationSteps"></div>
+        </div>
+      </div>
+
+      <div class="simulation-safety-note">
+        <b>No command will be queued.</b>
+        <span>Simulation is read-only. It cannot activate the pump, grow light, OTA, or any other FloraCore hardware.</span>
+      </div>
+
+      <div class="modal-actions">
+        <button class="studio-button secondary" id="closeSimulationButton" type="button">Close</button>
+        <button class="studio-button primary" id="runSimulationButton" type="button">Run simulation</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="automation-modal" id="advancedModal" hidden>
+    <section class="automation-modal-card" role="dialog" aria-modal="true" aria-labelledby="advancedModalTitle">
+      <span class="modal-kicker">ADVANCED / PHYSICAL CONTROL</span>
+      <h2 id="advancedModalTitle">Enable this automation?</h2>
+      <p>This flow may activate pumps or grow lights without another browser confirmation. FloraOS will still enforce server limits and the device must independently enforce local safety limits.</p>
+
+      <label class="advanced-confirm">
+        <input type="checkbox" id="advancedConfirmCheckbox" />
+        <span>I understand that this automation can activate physical hardware.</span>
+      </label>
+
+      <div class="modal-actions">
+        <button class="studio-button secondary" id="cancelEnableButton" type="button">Cancel</button>
+        <button class="studio-button primary" id="confirmEnableButton" type="button" disabled>Enable automation</button>
+      </div>
+    </section>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/automations.js') }}?v=20260901-cleanbar3" defer></script>
+</body>
+</html>

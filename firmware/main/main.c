@@ -1,0 +1,1514 @@
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
+
+#include "esp_adc/adc_oneshot.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_netif_sntp.h"
+#include "esp_timer.h"
+#include "nvs.h"
+
+#include "sdkconfig.h"
+
+#include "ble_terminal.h"
+#include "floraos_client.h"
+#include "floraos_phase20.h"
+#include "ota_manager.h"
+#include "setup_portal.h"
+#include "system_mode.h"
+#include "wifi_credentials.h"
+#include "wifi_manager.h"
+
+#define I2C_SDA_GPIO 40
+#define I2C_SCL_GPIO 45
+#define SOIL_MOISTURE_GPIO 10
+#define WATER_PUMP_GPIO GPIO_NUM_47
+#define PERISTALTIC_PUMP_GPIO GPIO_NUM_38
+#define GROW_LIGHT_GPIO GPIO_NUM_1
+
+#define BH1750_ADDRESS 0x23
+#define DS3231_ADDRESS 0x68
+#define BH1750_POWER_ON 0x01
+#define BH1750_CONT_H_RES 0x10
+
+#define PUMP_ON 1
+#define PUMP_OFF 0
+#define SAMPLE_COUNT 5
+#define FLORAOS_HEARTBEAT_INTERVAL_SECONDS 10
+
+/*
+ * Only a newly-installed OTA candidate waits here.  This gives the common
+ * FloraCore runtime a short settling period before the candidate is committed.
+ * It deliberately does not require internet access or external plant sensors.
+ */
+#define OTA_CANDIDATE_SETTLE_MS 2000
+
+#define SOIL_DRY_VALUE 1732
+#define SOIL_WET_VALUE 1235
+#define SOIL_OUT_OF_SOIL 2200
+#define SOIL_DRY_PERCENT 30
+#define SOIL_WET_PERCENT 70
+
+/*
+ * Local grow-light policy.
+ *
+ * RTC provides a 14-hour photoperiod (06:00-20:00). The BH1750 is used as an
+ * AMBIENT-light gate before the lamp turns on.
+ *
+ * Typical occupied rooms are only a few hundred lux, while sunny indoor
+ * positions can approach roughly 1000 lux. For an indoor herb prototype,
+ * ambient light below 1000 lux therefore requests supplemental lighting.
+ *
+ * Once the grow light is ON, BH1750 is deliberately NOT used to turn it back
+ * OFF: the sensor would see the grow light itself and could create a feedback
+ * loop. The RTC hard-stop at 20:00 ends the photoperiod.
+ *
+ * Tune this threshold after the BH1750 is mounted in its final position near
+ * canopy height.
+ */
+#define GROW_LIGHT_START_HOUR 6
+#define GROW_LIGHT_END_HOUR 20
+#define GROW_LIGHT_ON_BELOW_LUX 1000.0f
+#define GROW_LIGHT_MIN_OFF_SECONDS 60
+
+/*
+ * Local fertilizer policy.
+ *
+ * DS3231 day numbering follows sync_rtc_from_ntp():
+ * Sunday=1, Monday=2, ... Saturday=7.
+ *
+ * The peristaltic pump is deliberately NOT exposed as a cloud fertilize
+ * command yet. A short weekly local dose is scheduled from the RTC and the
+ * date is persisted BEFORE actuation so reboot cannot double-dose that day.
+ *
+ * IMPORTANT: calibrate FERTILIZER_RUN_MS against the actual pump flow and
+ * nutrient concentration before putting fertilizer in the reservoir.
+ */
+#define FERTILIZER_DAY_OF_WEEK 2
+#define FERTILIZER_HOUR 8
+#define FERTILIZER_MINUTE 0
+#define FERTILIZER_WINDOW_MINUTES 5
+#define FERTILIZER_RUN_MS 2000
+#define FERTILIZER_NVS_NAMESPACE "fertauto"
+#define FERTILIZER_NVS_LAST_DATE_KEY "last_date"
+
+#define TEMP_WIFI_PROVISIONING 0
+
+static const char *TAG = "FLORACORE";
+
+static i2c_master_dev_handle_t bh1750_handle;
+static i2c_master_dev_handle_t ds3231_handle;
+static adc_oneshot_unit_handle_t adc_handle;
+static adc_channel_t soil_adc_channel;
+
+static int64_t grow_light_last_change_us = 0;
+static esp_timer_handle_t fertilizer_timer = NULL;
+static nvs_handle_t fertilizer_nvs = 0;
+static bool fertilizer_nvs_open = false;
+
+typedef struct
+{
+    uint8_t seconds;
+    uint8_t minutes;
+    uint8_t hours;
+    uint8_t day;
+    uint8_t date;
+    uint8_t month;
+    uint8_t year;
+} rtc_time_t;
+
+/* Used by local actuator policy helpers declared before its definition. */
+static bool setup_blocks_normal_cloud_traffic(void);
+
+static uint8_t bcd_to_decimal(uint8_t bcd)
+{
+    return ((bcd >> 4) * 10) + (bcd & 0x0F);
+}
+
+static uint8_t decimal_to_bcd(uint8_t decimal)
+{
+    return ((decimal / 10) << 4) | (decimal % 10);
+}
+
+static void water_pump_init(void)
+{
+    gpio_config_t config = {
+        .pin_bit_mask = (1ULL << WATER_PUMP_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&config));
+    gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+}
+
+static void peristaltic_pump_init(void)
+{
+    gpio_config_t config = {
+        .pin_bit_mask = (1ULL << PERISTALTIC_PUMP_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&config));
+    ESP_ERROR_CHECK(gpio_set_level(PERISTALTIC_PUMP_GPIO, PUMP_OFF));
+}
+
+static esp_err_t phase20_fertilizer_set(bool on)
+{
+    if (on && ota_manager_update_in_progress()) {
+        (void)gpio_set_level(PERISTALTIC_PUMP_GPIO, PUMP_OFF);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return gpio_set_level(
+        PERISTALTIC_PUMP_GPIO,
+        on ? PUMP_ON : PUMP_OFF
+    );
+}
+
+static bool phase20_fertilizer_get(void)
+{
+    return gpio_get_level(PERISTALTIC_PUMP_GPIO) == PUMP_ON;
+}
+
+static void water_pump_on(void)
+{
+    /*
+     * Never energize the watering actuator while firmware is being replaced.
+     * The OTA task can reboot at any point after installation succeeds.
+     */
+    if (ota_manager_update_in_progress()) {
+        gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+        return;
+    }
+
+    gpio_set_level(WATER_PUMP_GPIO, PUMP_ON);
+}
+
+static void water_pump_off(void)
+{
+    gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+}
+
+static esp_err_t phase20_water_set(bool on)
+{
+    if (on && ota_manager_update_in_progress()) {
+        (void)gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return gpio_set_level(
+        WATER_PUMP_GPIO,
+        on ? PUMP_ON : PUMP_OFF
+    );
+}
+
+static bool phase20_water_get(void)
+{
+    return gpio_get_level(WATER_PUMP_GPIO) == PUMP_ON;
+}
+
+static void grow_light_init(void)
+{
+    gpio_config_t config = {
+        .pin_bit_mask = (1ULL << GROW_LIGHT_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&config));
+    ESP_ERROR_CHECK(gpio_set_level(GROW_LIGHT_GPIO, 0));
+}
+
+static esp_err_t phase20_grow_light_set(bool on)
+{
+    if (on && ota_manager_update_in_progress()) {
+        (void)gpio_set_level(GROW_LIGHT_GPIO, 0);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return gpio_set_level(GROW_LIGHT_GPIO, on ? 1 : 0);
+}
+
+static bool phase20_grow_light_get(void)
+{
+    return gpio_get_level(GROW_LIGHT_GPIO) != 0;
+}
+
+static esp_err_t bh1750_init(void)
+{
+    uint8_t command = BH1750_POWER_ON;
+    esp_err_t err =
+        i2c_master_transmit(bh1750_handle, &command, 1, 1000);
+
+    if (err != ESP_OK) return err;
+
+    command = BH1750_CONT_H_RES;
+    err = i2c_master_transmit(bh1750_handle, &command, 1, 1000);
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+    return err;
+}
+
+static esp_err_t bh1750_read_lux(float *lux)
+{
+    uint8_t data[2];
+    esp_err_t err =
+        i2c_master_receive(bh1750_handle, data, sizeof(data), 1000);
+
+    if (err != ESP_OK) return err;
+
+    uint16_t raw = ((uint16_t)data[0] << 8) | data[1];
+    *lux = raw / 1.2f;
+    return ESP_OK;
+}
+
+static esp_err_t bh1750_read_average(float *average_lux)
+{
+    float total = 0.0f;
+
+    for (int i = 0; i < SAMPLE_COUNT; i++) {
+        float lux = 0.0f;
+        esp_err_t err = bh1750_read_lux(&lux);
+        if (err != ESP_OK) return err;
+
+        total += lux;
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
+    *average_lux = total / SAMPLE_COUNT;
+    return ESP_OK;
+}
+
+static esp_err_t ds3231_read_time(rtc_time_t *time)
+{
+    uint8_t start_register = 0x00;
+    uint8_t data[7];
+
+    esp_err_t err = i2c_master_transmit_receive(
+        ds3231_handle,
+        &start_register,
+        1,
+        data,
+        sizeof(data),
+        1000
+    );
+    if (err != ESP_OK) return err;
+
+    time->seconds = bcd_to_decimal(data[0] & 0x7F);
+    time->minutes = bcd_to_decimal(data[1] & 0x7F);
+    time->hours = bcd_to_decimal(data[2] & 0x3F);
+    time->day = bcd_to_decimal(data[3] & 0x07);
+    time->date = bcd_to_decimal(data[4] & 0x3F);
+    time->month = bcd_to_decimal(data[5] & 0x1F);
+    time->year = bcd_to_decimal(data[6]);
+
+    return ESP_OK;
+}
+
+static esp_err_t ds3231_set_time(
+    uint8_t year,
+    uint8_t month,
+    uint8_t date,
+    uint8_t day,
+    uint8_t hours,
+    uint8_t minutes,
+    uint8_t seconds
+)
+{
+    uint8_t data[8] = {
+        0x00,
+        decimal_to_bcd(seconds),
+        decimal_to_bcd(minutes),
+        decimal_to_bcd(hours),
+        decimal_to_bcd(day),
+        decimal_to_bcd(date),
+        decimal_to_bcd(month),
+        decimal_to_bcd(year)
+    };
+
+    return i2c_master_transmit(
+        ds3231_handle,
+        data,
+        sizeof(data),
+        1000
+    );
+}
+
+static esp_err_t sync_rtc_from_ntp(void)
+{
+    esp_sntp_config_t config =
+        ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+
+    esp_err_t err = esp_netif_sntp_init(&config);
+    if (err != ESP_OK) return err;
+
+    err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000));
+    if (err != ESP_OK) {
+        esp_netif_sntp_deinit();
+        return err;
+    }
+
+    setenv("TZ", "MYT-8", 1);
+    tzset();
+
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    err = ds3231_set_time(
+        (uint8_t)((timeinfo.tm_year + 1900) % 100),
+        (uint8_t)(timeinfo.tm_mon + 1),
+        (uint8_t)timeinfo.tm_mday,
+        (uint8_t)(timeinfo.tm_wday + 1),
+        (uint8_t)timeinfo.tm_hour,
+        (uint8_t)timeinfo.tm_min,
+        (uint8_t)timeinfo.tm_sec
+    );
+
+    if (err == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "NTP synchronized -> DS3231: %02d:%02d:%02d %02d/%02d/%04d",
+            timeinfo.tm_hour,
+            timeinfo.tm_min,
+            timeinfo.tm_sec,
+            timeinfo.tm_mday,
+            timeinfo.tm_mon + 1,
+            timeinfo.tm_year + 1900
+        );
+    }
+
+    esp_netif_sntp_deinit();
+    return err;
+}
+
+static void soil_moisture_init(void)
+{
+    adc_unit_t unit;
+
+    ESP_ERROR_CHECK(
+        adc_oneshot_io_to_channel(
+            SOIL_MOISTURE_GPIO,
+            &unit,
+            &soil_adc_channel
+        )
+    );
+
+    adc_oneshot_unit_init_cfg_t init = {.unit_id = unit};
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init, &adc_handle));
+
+    adc_oneshot_chan_cfg_t channel = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT
+    };
+
+    ESP_ERROR_CHECK(
+        adc_oneshot_config_channel(
+            adc_handle,
+            soil_adc_channel,
+            &channel
+        )
+    );
+}
+
+static esp_err_t soil_moisture_read_average(int *average_raw)
+{
+    int total = 0;
+
+    for (int i = 0; i < SAMPLE_COUNT; i++) {
+        int raw = 0;
+        esp_err_t err =
+            adc_oneshot_read(adc_handle, soil_adc_channel, &raw);
+
+        if (err != ESP_OK) return err;
+        total += raw;
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    *average_raw = total / SAMPLE_COUNT;
+    return ESP_OK;
+}
+
+static int soil_adc_to_percent(int adc_value)
+{
+    int moisture =
+        ((SOIL_DRY_VALUE - adc_value) * 100) /
+        (SOIL_DRY_VALUE - SOIL_WET_VALUE);
+
+    if (moisture < 0) moisture = 0;
+    if (moisture > 100) moisture = 100;
+    return moisture;
+}
+
+static const char *soil_get_status(int moisture_percent)
+{
+    if (moisture_percent < SOIL_DRY_PERCENT) return "DRY";
+    if (moisture_percent < SOIL_WET_PERCENT) return "GOOD";
+    return "WET";
+}
+
+
+static bool rtc_calendar_valid(const rtc_time_t *rtc)
+{
+    if (rtc == NULL) return false;
+
+    return
+        rtc->seconds <= 59 &&
+        rtc->minutes <= 59 &&
+        rtc->hours <= 23 &&
+        rtc->day >= 1 && rtc->day <= 7 &&
+        rtc->date >= 1 && rtc->date <= 31 &&
+        rtc->month >= 1 && rtc->month <= 12;
+}
+
+static bool grow_light_dwell_elapsed(uint32_t seconds)
+{
+    if (grow_light_last_change_us == 0) return true;
+
+    int64_t elapsed_us = esp_timer_get_time() - grow_light_last_change_us;
+    return elapsed_us >= (int64_t)seconds * 1000000LL;
+}
+
+static void grow_light_set_local(bool on, const char *reason)
+{
+    bool current = phase20_grow_light_get();
+    if (current == on) return;
+
+    esp_err_t err = phase20_grow_light_set(on);
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Grow light could not turn %s: %s",
+            on ? "ON" : "OFF",
+            esp_err_to_name(err)
+        );
+        return;
+    }
+
+    grow_light_last_change_us = esp_timer_get_time();
+
+    ESP_LOGI(
+        TAG,
+        "Grow light: %s (%s)",
+        on ? "ON" : "OFF",
+        reason != NULL ? reason : "local policy"
+    );
+}
+
+static void grow_light_apply_local_policy(
+    bool light_valid,
+    float lux,
+    bool rtc_valid,
+    const rtc_time_t *rtc
+)
+{
+    if (
+        ota_manager_update_in_progress() ||
+        setup_blocks_normal_cloud_traffic()
+    ) {
+        grow_light_set_local(false, "setup/OTA safety");
+        return;
+    }
+
+    if (!rtc_valid || !rtc_calendar_valid(rtc)) {
+        grow_light_set_local(false, "RTC unavailable");
+        return;
+    }
+
+    /*
+     * A timed authenticated grow-light ON command owns the actuator until its
+     * local auto-off timer expires. Do not let sensor automation race it.
+     */
+    if (floraos_phase20_grow_light_override_active()) {
+        return;
+    }
+
+    bool in_photoperiod =
+        rtc->hours >= GROW_LIGHT_START_HOUR &&
+        rtc->hours < GROW_LIGHT_END_HOUR;
+
+    if (!in_photoperiod) {
+        grow_light_set_local(false, "outside RTC photoperiod");
+        return;
+    }
+
+    if (!light_valid) {
+        /*
+         * Fail closed on a fresh boot. If the light was already ON, keep its
+         * current state until the RTC reaches the hard END_HOUR.
+         */
+        return;
+    }
+
+    bool current = phase20_grow_light_get();
+
+    if (
+        !current &&
+        lux < GROW_LIGHT_ON_BELOW_LUX &&
+        grow_light_dwell_elapsed(GROW_LIGHT_MIN_OFF_SECONDS)
+    ) {
+        grow_light_set_local(true, "BH1750 below daylight threshold");
+        return;
+    }
+
+    /*
+     * If already ON, keep the lamp ON until the RTC photoperiod ends.
+     * Do not compare the BH1750 reading against an OFF threshold here because
+     * the sensor is also illuminated by the grow light itself.
+     */
+}
+
+static uint32_t fertilizer_date_key(const rtc_time_t *rtc)
+{
+    return
+        (uint32_t)rtc->year * 10000U +
+        (uint32_t)rtc->month * 100U +
+        (uint32_t)rtc->date;
+}
+
+static void fertilizer_auto_off(void *argument)
+{
+    (void)argument;
+
+    (void)phase20_fertilizer_set(false);
+    ESP_LOGI(TAG, "Peristaltic pump: OFF (scheduled dose complete)");
+}
+
+static esp_err_t fertilizer_automation_init(void)
+{
+    esp_timer_create_args_t timer_args = {
+        .callback = fertilizer_auto_off,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "fert_auto_off",
+        .skip_unhandled_events = true
+    };
+
+    esp_err_t err = esp_timer_create(&timer_args, &fertilizer_timer);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(
+        FERTILIZER_NVS_NAMESPACE,
+        NVS_READWRITE,
+        &fertilizer_nvs
+    );
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    fertilizer_nvs_open = true;
+    return ESP_OK;
+}
+
+static bool fertilizer_already_dosed_today(const rtc_time_t *rtc)
+{
+    if (!fertilizer_nvs_open || rtc == NULL) return true;
+
+    uint32_t last_date = 0;
+    esp_err_t err = nvs_get_u32(
+        fertilizer_nvs,
+        FERTILIZER_NVS_LAST_DATE_KEY,
+        &last_date
+    );
+
+    if (err == ESP_ERR_NVS_NOT_FOUND) return false;
+    if (err != ESP_OK) return true;
+
+    return last_date == fertilizer_date_key(rtc);
+}
+
+static bool fertilizer_mark_dosed_today(const rtc_time_t *rtc)
+{
+    if (!fertilizer_nvs_open || rtc == NULL) return false;
+
+    esp_err_t err = nvs_set_u32(
+        fertilizer_nvs,
+        FERTILIZER_NVS_LAST_DATE_KEY,
+        fertilizer_date_key(rtc)
+    );
+    if (err != ESP_OK) return false;
+
+    return nvs_commit(fertilizer_nvs) == ESP_OK;
+}
+
+static void fertilizer_apply_local_schedule(
+    bool rtc_valid,
+    const rtc_time_t *rtc
+)
+{
+    if (
+        !rtc_valid ||
+        !rtc_calendar_valid(rtc) ||
+        !fertilizer_nvs_open ||
+        fertilizer_timer == NULL
+    ) {
+        return;
+    }
+
+    if (
+        ota_manager_update_in_progress() ||
+        setup_blocks_normal_cloud_traffic()
+    ) {
+        if (esp_timer_is_active(fertilizer_timer)) {
+            (void)esp_timer_stop(fertilizer_timer);
+        }
+        (void)phase20_fertilizer_set(false);
+        return;
+    }
+
+    if (esp_timer_is_active(fertilizer_timer)) {
+        return;
+    }
+
+    if (rtc->day != FERTILIZER_DAY_OF_WEEK) {
+        return;
+    }
+
+    int now_minutes =
+        (int)rtc->hours * 60 +
+        (int)rtc->minutes;
+
+    int scheduled_minutes =
+        FERTILIZER_HOUR * 60 +
+        FERTILIZER_MINUTE;
+
+    if (
+        now_minutes < scheduled_minutes ||
+        now_minutes >= scheduled_minutes + FERTILIZER_WINDOW_MINUTES
+    ) {
+        return;
+    }
+
+    if (fertilizer_already_dosed_today(rtc)) {
+        return;
+    }
+
+    /*
+     * Persist first: if power fails after the pump starts, this date will not
+     * be dosed again after reboot. Fail-closed is safer than double dosing.
+     */
+    if (!fertilizer_mark_dosed_today(rtc)) {
+        ESP_LOGW(TAG, "Fertilizer dose skipped: could not persist dose date");
+        return;
+    }
+
+    esp_err_t err = phase20_fertilizer_set(true);
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Peristaltic pump could not start: %s",
+            esp_err_to_name(err)
+        );
+        return;
+    }
+
+    err = esp_timer_start_once(
+        fertilizer_timer,
+        (uint64_t)FERTILIZER_RUN_MS * 1000ULL
+    );
+
+    if (err != ESP_OK) {
+        (void)phase20_fertilizer_set(false);
+        ESP_LOGW(
+            TAG,
+            "Peristaltic pump timer failed: %s",
+            esp_err_to_name(err)
+        );
+        return;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Peristaltic pump: ON for %d ms (weekly RTC dose)",
+        FERTILIZER_RUN_MS
+    );
+}
+
+static bool setup_blocks_normal_cloud_traffic(void)
+{
+    if (!setup_portal_is_active()) {
+        return false;
+    }
+
+    return setup_portal_state() != SETUP_SUCCESS;
+}
+
+
+static bool floracore_ble_command(
+    uint16_t conn_handle,
+    const char *command
+)
+{
+    if (command == NULL) {
+        return false;
+    }
+
+    if (strcmp(command, "ota status") == 0) {
+        ble_terminal_printf(
+            conn_handle,
+            "Firmware version: %s\r\n"
+            "OTA candidate pending verification: %s\r\n"
+            "OTA update in progress: %s\r\n",
+            ota_manager_get_version(),
+            ota_manager_is_pending_verify() ? "yes" : "no",
+            ota_manager_update_in_progress() ? "yes" : "no"
+        );
+
+        return true;
+    }
+
+    if (strcmp(command, "ota test") != 0) {
+        return false;
+    }
+
+#if CONFIG_FLORACORE_OTA_DEV_TEST
+    if (ota_manager_is_pending_verify()) {
+        ble_terminal_send(
+            conn_handle,
+            "OTA test refused: this firmware is still pending validation.\r\n"
+        );
+
+        return true;
+    }
+
+    if (ota_manager_update_in_progress()) {
+        ble_terminal_send(
+            conn_handle,
+            "OTA update is already in progress.\r\n"
+        );
+
+        return true;
+    }
+
+    if (!wifi_manager_station_ready()) {
+        ble_terminal_send(
+            conn_handle,
+            "OTA test requires Wi-Fi association and DHCP first.\r\n"
+        );
+
+        return true;
+    }
+
+    if (setup_blocks_normal_cloud_traffic()) {
+        ble_terminal_send(
+            conn_handle,
+            "OTA test is blocked while first-time setup/claim is active.\r\n"
+        );
+
+        return true;
+    }
+
+    if (system_mode_load() == FLORACORE_MODE_NORMAL) {
+        water_pump_off();
+        floraos_phase20_force_safe_outputs();
+    }
+
+    esp_err_t err =
+        ota_manager_start_update(
+            CONFIG_FLORACORE_OTA_TEST_URL,
+            CONFIG_FLORACORE_OTA_TEST_EXPECTED_VERSION
+        );
+
+    if (err == ESP_OK) {
+        ble_terminal_printf(
+            conn_handle,
+            "OTA test started.\r\n"
+            "Current: %s\r\n"
+            "Expected: %s\r\n"
+            "Source: floraos.life firmware origin\r\n"
+            "Progress is logged on the serial console. "
+            "FloraCore will reboot automatically if installation succeeds.\r\n",
+            ota_manager_get_version(),
+            CONFIG_FLORACORE_OTA_TEST_EXPECTED_VERSION
+        );
+    } else {
+        ble_terminal_printf(
+            conn_handle,
+            "Could not start OTA test: %s\r\n",
+            esp_err_to_name(err)
+        );
+    }
+#else
+    ble_terminal_send(
+        conn_handle,
+        "Developer OTA test is disabled. Open menuconfig -> FloraCore OTA -> "
+        "Enable developer-only BLE OTA test command.\r\n"
+    );
+#endif
+
+    return true;
+}
+
+
+static bool floraos_cloud_housekeeping(
+    floracore_mode_t boot_mode,
+    bool *hello_announced
+)
+{
+    /*
+     * OTA owns the network/flash update window. Avoid competing hello,
+     * heartbeat, telemetry and NTP activity until the update finishes or
+     * aborts. The device reboots automatically after a successful install.
+     */
+    if (ota_manager_update_in_progress()) {
+        floraos_phase20_force_safe_outputs();
+        if (hello_announced != NULL) {
+            *hello_announced = false;
+        }
+        return false;
+    }
+
+    /*
+     * First-time onboarding owns the FloraOS cloud channel until ownership
+     * is confirmed. During SETUP_IDLE / CONNECTING / WIFI_CONNECTED /
+     * CLAIMING / FAILED, setup_portal.c may send only the encrypted claim.
+     *
+     * This prevents hello/heartbeat/telemetry from competing with the
+     * ownership handshake on a factory-new FloraCore.
+     */
+    if (setup_blocks_normal_cloud_traffic()) {
+        floraos_phase20_force_safe_outputs();
+        if (hello_announced != NULL) {
+            *hello_announced = false;
+        }
+        return false;
+    }
+
+    if (!wifi_manager_station_ready()) {
+        if (hello_announced != NULL) {
+            *hello_announced = false;
+        }
+        return false;
+    }
+
+    if (!floraos_client_is_ready()) {
+        esp_err_t init_err = floraos_client_init();
+        if (init_err != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "FloraOS secure client init deferred: %s",
+                esp_err_to_name(init_err)
+            );
+            return false;
+        }
+    }
+
+    if (hello_announced != NULL && !*hello_announced) {
+        char payload[160] = {0};
+
+        snprintf(
+            payload,
+            sizeof(payload),
+            "{\"mode\":\"%s\",\"event\":\"online\"}",
+            system_mode_name(boot_mode)
+        );
+
+        esp_err_t send_err =
+            floraos_client_queue_message("hello", payload);
+
+        if (send_err == ESP_OK) {
+            *hello_announced = true;
+        }
+    }
+
+    return floraos_client_is_ready();
+}
+
+
+/*
+ * Confirm a newly-installed OTA image only after FloraCore's common software
+ * stack is demonstrably alive.
+ *
+ * What counts as health here:
+ *   - OTA metadata can be read
+ *   - encrypted NVS / Wi-Fi stack initialized (already reached this point)
+ *   - system mode loaded
+ *   - BLE terminal initialized
+ *   - HMAC_UP-derived FloraOS crypto + HTTPS worker initialized
+ *   - if Wi-Fi recovery is required, the setup portal started successfully
+ *
+ * Deliberately NOT required:
+ *   - internet / Cloudflare / floraos.life availability
+ *   - BH1750, DS3231 or soil sensor presence
+ *
+ * Network outages and disconnected plant sensors are environmental conditions,
+ * not evidence that the firmware image itself is broken.
+ */
+static void ota_validate_candidate(
+    bool setup_required,
+    esp_err_t setup_start_result
+)
+{
+    if (!ota_manager_is_pending_verify()) {
+        return;
+    }
+
+    ESP_LOGW(
+        TAG,
+        "Validating newly-installed OTA candidate..."
+    );
+
+    /*
+     * floraos_client_init() performs the local hardware-derived identity /
+     * AES-GCM initialization and starts the existing dedicated HTTPS worker.
+     * It does not need an active Wi-Fi connection to initialize.
+     */
+    esp_err_t crypto_err =
+        floraos_client_init();
+
+    if (crypto_err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "OTA candidate failed FloraOS crypto/client self-test: %s",
+            esp_err_to_name(crypto_err)
+        );
+
+        ESP_ERROR_CHECK(
+            ota_manager_rollback_and_reboot(
+                "HMAC_UP / FloraOS crypto-client initialization failed"
+            )
+        );
+
+        return;
+    }
+
+    if (
+        setup_required &&
+        setup_start_result != ESP_OK
+    ) {
+        ESP_LOGE(
+            TAG,
+            "OTA candidate cannot provide required recovery setup: %s",
+            esp_err_to_name(setup_start_result)
+        );
+
+        ESP_ERROR_CHECK(
+            ota_manager_rollback_and_reboot(
+                "required beginner setup portal could not start"
+            )
+        );
+
+        return;
+    }
+
+    /*
+     * Give common background tasks a brief chance to expose an immediate
+     * startup fault.  This delay happens only once on the first boot of a
+     * newly-installed OTA image.
+     */
+    vTaskDelay(
+        pdMS_TO_TICKS(
+            OTA_CANDIDATE_SETTLE_MS
+        )
+    );
+
+    esp_err_t valid_err =
+        ota_manager_mark_valid();
+
+    if (valid_err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not commit OTA candidate as valid: %s",
+            esp_err_to_name(valid_err)
+        );
+
+        /*
+         * Do not continue indefinitely with an unconfirmed candidate.
+         */
+        ESP_ERROR_CHECK(
+            ota_manager_rollback_and_reboot(
+                "could not commit OTA validity"
+            )
+        );
+    }
+}
+
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting FloraCore...");
+
+    /*
+     * Read OTA state before bringing up the rest of FloraCore.  This does not
+     * accept a candidate; it merely records whether this is its one
+     * PENDING_VERIFY boot.
+     */
+    ESP_ERROR_CHECK(
+        ota_manager_init()
+    );
+
+    wifi_manager_init();
+
+    floracore_mode_t boot_mode = system_mode_load();
+
+    bool phase20_ready = false;
+
+    if (boot_mode == FLORACORE_MODE_NORMAL) {
+        water_pump_init();
+        peristaltic_pump_init();
+        grow_light_init();
+
+        esp_err_t fertilizer_init_err = fertilizer_automation_init();
+        if (fertilizer_init_err != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "Fertilizer automation disabled: %s",
+                esp_err_to_name(fertilizer_init_err)
+            );
+        }
+
+        floraos_phase20_ops_t phase20_ops = {
+            .setup_blocked = setup_blocks_normal_cloud_traffic,
+            .ota_in_progress = ota_manager_update_in_progress,
+            .water_set = phase20_water_set,
+            .water_get = phase20_water_get,
+            .grow_light_set = phase20_grow_light_set,
+            .grow_light_get = phase20_grow_light_get,
+            .fertilizer_set = phase20_fertilizer_set,
+            .fertilizer_get = phase20_fertilizer_get
+        };
+
+        esp_err_t phase20_err = floraos_phase20_init(&phase20_ops);
+        if (phase20_err == ESP_OK) {
+            phase20_ready = true;
+        } else {
+            ESP_LOGE(
+                TAG,
+                "Phase 20 command/runtime init failed; command_protocol will stay disabled: %s",
+                esp_err_to_name(phase20_err)
+            );
+        }
+    }
+
+    ESP_ERROR_CHECK(ble_terminal_init());
+
+    ble_terminal_set_command_handler(floracore_ble_command);
+
+#if TEMP_WIFI_PROVISIONING
+    ESP_ERROR_CHECK(
+        wifi_credentials_save(
+            "YOUR_WIFI_SSID",
+            "YOUR_WIFI_PASSWORD"
+        )
+    );
+#endif
+
+    bool boot_network_ready = wifi_manager_connect();
+
+    if (boot_network_ready) {
+        ESP_LOGI(
+            TAG,
+            "FloraCore Wi-Fi is ready; FloraOS will verify service reachability"
+        );
+    } else {
+        ESP_LOGW(
+            TAG,
+            "No usable saved Wi-Fi."
+        );
+    }
+
+    bool resume_setup = setup_portal_should_resume();
+    bool setup_required =
+        !boot_network_ready ||
+        resume_setup;
+
+    esp_err_t setup_start_result =
+        ESP_OK;
+
+    if (setup_required) {
+        ESP_LOGW(
+            TAG,
+            "%s. Starting beginner setup mode.",
+            resume_setup
+                ? "Previous customer setup has not completed ownership"
+                : "FloraCore needs Wi-Fi configuration"
+        );
+
+        setup_start_result =
+            setup_portal_start();
+
+        if (setup_start_result != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Could not start consumer setup portal: %s",
+                esp_err_to_name(setup_start_result)
+            );
+        }
+    }
+
+    /*
+     * If this is the first boot of a downloaded candidate, it is still
+     * PENDING_VERIFY here.  Validate the common FloraCore runtime before
+     * allowing ESP-IDF to regard it as a permanent boot image.
+     */
+    ota_validate_candidate(
+        setup_required,
+        setup_start_result
+    );
+
+    bool cloud_hello_announced = false;
+    (void)floraos_cloud_housekeeping(
+        boot_mode,
+        &cloud_hello_announced
+    );
+
+    if (boot_mode == FLORACORE_MODE_COM_DEV) {
+        ESP_LOGW(TAG, "COM DEV MODE ACTIVE");
+
+        while (1) {
+            bool cloud_ready = floraos_cloud_housekeeping(
+                boot_mode,
+                &cloud_hello_announced
+            );
+
+            if (cloud_ready && !setup_blocks_normal_cloud_traffic()) {
+                char *heartbeat_payload =
+                    floraos_phase20_build_heartbeat("COM DEV", false);
+
+                if (heartbeat_payload != NULL) {
+                    (void)floraos_phase20_queue_message(
+                        "heartbeat",
+                        heartbeat_payload,
+                        false
+                    );
+                    floraos_phase20_free_payload(heartbeat_payload);
+                }
+            }
+
+            vTaskDelay(
+                pdMS_TO_TICKS(
+                    FLORAOS_HEARTBEAT_INTERVAL_SECONDS * 1000
+                )
+            );
+        }
+    }
+
+    i2c_master_bus_config_t bus_config = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = -1,
+        .sda_io_num = I2C_SDA_GPIO,
+        .scl_io_num = I2C_SCL_GPIO,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true
+    };
+
+    i2c_master_bus_handle_t bus_handle;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus_handle));
+
+    if (i2c_master_probe(
+            bus_handle,
+            BH1750_ADDRESS,
+            1000
+        ) != ESP_OK) {
+        ESP_LOGE(TAG, "BH1750 not found!");
+        water_pump_off();
+        return;
+    }
+
+    if (i2c_master_probe(
+            bus_handle,
+            DS3231_ADDRESS,
+            1000
+        ) != ESP_OK) {
+        ESP_LOGE(TAG, "DS3231 not found!");
+        water_pump_off();
+        return;
+    }
+
+    i2c_device_config_t bh1750_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = BH1750_ADDRESS,
+        .scl_speed_hz = 100000
+    };
+
+    ESP_ERROR_CHECK(
+        i2c_master_bus_add_device(
+            bus_handle,
+            &bh1750_config,
+            &bh1750_handle
+        )
+    );
+
+    i2c_device_config_t ds3231_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = DS3231_ADDRESS,
+        .scl_speed_hz = 100000
+    };
+
+    ESP_ERROR_CHECK(
+        i2c_master_bus_add_device(
+            bus_handle,
+            &ds3231_config,
+            &ds3231_handle
+        )
+    );
+
+    ESP_ERROR_CHECK(bh1750_init());
+    soil_moisture_init();
+
+    bool rtc_ntp_synced = false;
+
+    if (
+        wifi_manager_station_ready() &&
+        !setup_blocks_normal_cloud_traffic()
+    ) {
+        if (sync_rtc_from_ntp() == ESP_OK) {
+            rtc_ntp_synced = true;
+        }
+    }
+
+    uint32_t cloud_cycle = 0;
+
+    /*
+     * NORMAL mode sends a dedicated authenticated heartbeat every 10 seconds.
+     * Start at zero so the first heartbeat is sent as soon as normal cloud
+     * traffic becomes available after first-time setup succeeds.
+     */
+    int64_t last_heartbeat_us = 0;
+
+    while (1) {
+        float average_lux = 0.0f;
+        int average_soil = 0;
+        int soil_percent_for_cloud = -1;
+        bool soil_adc_valid = false;
+        bool soil_percent_valid = false;
+        bool pump_for_cloud = false;
+        bool light_valid = false;
+        bool rtc_valid = false;
+        rtc_time_t rtc = {0};
+
+        if (bh1750_read_average(&average_lux) == ESP_OK) {
+            light_valid = true;
+            ESP_LOGI(TAG, "Average Light: %.2f lux", average_lux);
+        }
+
+        esp_err_t rtc_err = ds3231_read_time(&rtc);
+        if (rtc_err == ESP_OK) {
+            rtc_valid = true;
+            ESP_LOGI(
+                TAG,
+                "RTC: %02u:%02u:%02u %02u/%02u/20%02u",
+                rtc.hours,
+                rtc.minutes,
+                rtc.seconds,
+                rtc.date,
+                rtc.month,
+                rtc.year
+            );
+        } else {
+            ESP_LOGW(
+                TAG,
+                "RTC read failed: %s",
+                esp_err_to_name(rtc_err)
+            );
+        }
+
+        if (soil_moisture_read_average(&average_soil) == ESP_OK) {
+            soil_adc_valid = true;
+
+            if (average_soil >= SOIL_OUT_OF_SOIL) {
+                floraos_phase20_set_water_lockout(true);
+                if (!floraos_phase20_water_command_active()) {
+                    water_pump_off();
+                }
+
+                ESP_LOGW(
+                    TAG,
+                    "Soil ADC: %d | Sensor appears OUT OF SOIL / disconnected | PUMP: OFF",
+                    average_soil
+                );
+            } else {
+                floraos_phase20_set_water_lockout(false);
+
+                int soil_percent = soil_adc_to_percent(average_soil);
+                soil_percent_for_cloud = soil_percent;
+                soil_percent_valid = true;
+
+                /*
+                 * A validated cloud watering command temporarily owns the
+                 * water actuator. The local soil loop must not race it.
+                 */
+                if (!floraos_phase20_water_command_active()) {
+                    if (soil_percent < SOIL_DRY_PERCENT) {
+                        water_pump_on();
+                    } else {
+                        water_pump_off();
+                    }
+                }
+
+                pump_for_cloud = phase20_water_get();
+
+                ESP_LOGI(
+                    TAG,
+                    "Soil ADC: %d | Moisture: %d%% | Status: %s | PUMP: %s",
+                    average_soil,
+                    soil_percent,
+                    soil_get_status(soil_percent),
+                    pump_for_cloud ? "ON" : "OFF"
+                );
+            }
+        } else {
+            floraos_phase20_set_water_lockout(true);
+            if (!floraos_phase20_water_command_active()) {
+                water_pump_off();
+            }
+
+            ESP_LOGW(
+                TAG,
+                "Soil moisture ADC read failed on GPIO%d",
+                SOIL_MOISTURE_GPIO
+            );
+        }
+
+        grow_light_apply_local_policy(
+            light_valid,
+            average_lux,
+            rtc_valid,
+            &rtc
+        );
+
+        fertilizer_apply_local_schedule(
+            rtc_valid,
+            &rtc
+        );
+
+        pump_for_cloud = phase20_water_get();
+
+        bool cloud_ready = floraos_cloud_housekeeping(
+            boot_mode,
+            &cloud_hello_announced
+        );
+
+        /*
+         * Device liveness is intentionally heartbeat-based. Telemetry, hello,
+         * claim, and other authenticated messages do not substitute for this
+         * heartbeat when the dashboard determines ONLINE/OFFLINE state.
+         */
+        if (cloud_ready && !setup_blocks_normal_cloud_traffic()) {
+            int64_t now_us = esp_timer_get_time();
+            int64_t heartbeat_interval_us =
+                (int64_t)FLORAOS_HEARTBEAT_INTERVAL_SECONDS * 1000000LL;
+
+            if (
+                last_heartbeat_us == 0 ||
+                now_us - last_heartbeat_us >= heartbeat_interval_us
+            ) {
+                char *heartbeat_payload =
+                    floraos_phase20_build_heartbeat(
+                        "NORMAL",
+                        phase20_ready
+                    );
+
+                if (heartbeat_payload != NULL) {
+                    esp_err_t heartbeat_err =
+                        floraos_phase20_queue_message(
+                            "heartbeat",
+                            heartbeat_payload,
+                            phase20_ready
+                        );
+
+                    floraos_phase20_free_payload(heartbeat_payload);
+
+                    if (heartbeat_err == ESP_OK) {
+                        last_heartbeat_us = now_us;
+                    } else {
+                        ESP_LOGW(
+                            TAG,
+                            "Could not queue heartbeat: %s",
+                            esp_err_to_name(heartbeat_err)
+                        );
+                    }
+                } else {
+                    ESP_LOGW(TAG, "Could not build Phase 20 heartbeat payload");
+                }
+            }
+        }
+
+        if (cloud_ready && !rtc_ntp_synced) {
+            if (sync_rtc_from_ntp() == ESP_OK) {
+                rtc_ntp_synced = true;
+            }
+        }
+
+        cloud_cycle++;
+
+        if (
+            cloud_ready &&
+            !setup_blocks_normal_cloud_traffic() &&
+            cloud_cycle >= 30
+        ) {
+            cloud_cycle = 0;
+
+            floraos_phase20_telemetry_t telemetry = {
+                .soil_adc_valid = soil_adc_valid,
+                .soil_adc = average_soil,
+                .soil_percent_valid = soil_percent_valid,
+                .soil_percent = soil_percent_for_cloud,
+                .light_valid = light_valid,
+                .light_lux = average_lux,
+                .pump_on = pump_for_cloud,
+                .grow_light_valid = true,
+                .grow_light_on = phase20_grow_light_get(),
+                .fertilizer_pump_valid = true,
+                .fertilizer_pump_on = phase20_fertilizer_get(),
+                .rtc_valid = rtc_valid,
+                .rtc_text = {0}
+            };
+
+            if (rtc_valid) {
+                snprintf(
+                    telemetry.rtc_text,
+                    sizeof(telemetry.rtc_text),
+                    "%02u:%02u:%02u %02u/%02u/20%02u",
+                    rtc.hours,
+                    rtc.minutes,
+                    rtc.seconds,
+                    rtc.date,
+                    rtc.month,
+                    rtc.year
+                );
+            }
+
+            char *telemetry_payload =
+                floraos_phase20_build_telemetry(
+                    "NORMAL",
+                    &telemetry,
+                    phase20_ready
+                );
+
+            if (telemetry_payload != NULL) {
+                (void)floraos_phase20_queue_message(
+                    "telemetry",
+                    telemetry_payload,
+                    phase20_ready
+                );
+                floraos_phase20_free_payload(telemetry_payload);
+            } else {
+                ESP_LOGW(TAG, "Could not build telemetry payload");
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}

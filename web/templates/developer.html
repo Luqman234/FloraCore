@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07111F" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
+  <title>Developer — FloraCore</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/developer.css') }}" />
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='icons/favicon.svg') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/favicon-32x32.png') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="64x64" href="{{ url_for('static', filename='icons/favicon-64x64.png') }}?v=20260901">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='icons/favicon.ico') }}?v=20260901">
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='icons/apple-touch-icon.png') }}?v=20260901">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="FloraCore home">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span>FloraCore</span>
+    </a>
+    <div class="topbar-meta">
+      <span class="developer-version">API v1.2</span>
+      <span class="user-id-badge" title="FloraCore User ID">USER ID {{ user_id }}</span>
+      <span id="sessionLabel">{{ user_email }}</span>
+      <a class="topbar-link" href="/dashboard">Workspace</a>
+    </div>
+  </header>
+
+  <main class="developer-shell">
+    <aside class="developer-sidebar" aria-label="Settings navigation">
+      <span class="side-label">SETTINGS</span>
+      <a href="/dashboard">Account</a>
+      <span class="side-label second">DEVELOPER</span>
+      <a class="active" href="/settings/developer">API Tokens</a>
+      <a href="#quickstart">API Quickstart</a>
+      <a href="/docs">Documentation</a>
+    </aside>
+
+    <section class="developer-workspace">
+      <div class="developer-head">
+        <div>
+          <span class="eyebrow">FLORAOS / PUBLIC API</span>
+          <h1>API Tokens</h1>
+          <p>Create credentials for scripts, integrations, external dashboards, and future applications without exposing FloraCore hardware keys.</p>
+        </div>
+        <button class="create-token-button" id="openCreateToken" type="button">Create API Token <span aria-hidden="true">＋</span></button>
+      </div>
+
+      <section class="security-boundary" aria-label="API security boundary">
+        <div>
+          <span>USER / APPLICATION PLANE</span>
+          <strong>Personal Access Token</strong>
+          <small>flora_pat_…</small>
+        </div>
+        <i aria-hidden="true"></i>
+        <div>
+          <span>OWNERSHIP</span>
+          <strong>Your FloraCore devices only</strong>
+          <small>server-enforced</small>
+        </div>
+        <i aria-hidden="true"></i>
+        <div>
+          <span>DEVICE PLANE</span>
+          <strong>Remains private</strong>
+          <small>HMAC + AES-256-GCM</small>
+        </div>
+      </section>
+
+      <div class="developer-grid">
+        <section class="token-panel">
+          <div class="panel-title-row">
+            <div>
+              <span>PERSONAL ACCESS TOKENS</span>
+              <h2>Your tokens</h2>
+            </div>
+            <button class="text-action" id="refreshTokens" type="button">Refresh</button>
+          </div>
+          <div class="token-list" id="tokenList" aria-live="polite">
+            <div class="token-loading">Loading API tokens…</div>
+          </div>
+        </section>
+
+        <aside class="api-overview-card">
+          <span class="card-kicker">FLORAOS API v1.2</span>
+          <h2>Built for integrations.</h2>
+          <p>The public API reads authenticated state and can queue tightly validated device commands. Delivery still uses the private encrypted ESP32 transport.</p>
+          <dl>
+            <div><dt>Base path</dt><dd>/api/v1</dd></div>
+            <div><dt>Authentication</dt><dd>Bearer PAT</dd></div>
+            <div><dt>Heartbeat</dt><dd>Online ≤ 120s</dd></div>
+            <div><dt>Telemetry page max</dt><dd>100</dd></div>
+            <div><dt>Physical control</dt><dd>Typed command queue</dd></div>
+          </dl>
+        </aside>
+      </div>
+
+      <section class="quickstart" id="quickstart">
+        <div class="panel-title-row">
+          <div>
+            <span>QUICKSTART</span>
+            <h2>Make your first request</h2>
+          </div>
+        </div>
+        <p>Send the token in the standard <code>Authorization</code> header. Your numeric FloraCore User ID identifies the account; the PAT authenticates the caller.</p>
+        <p><strong>Control safety:</strong> physical commands require the <code>devices:control</code> scope and an <code>Idempotency-Key</code>. FloraOS never accepts raw GPIO, arbitrary commands, or OTA URLs through the public API.</p>
+        <div class="code-card">
+          <div class="code-card-head"><span>GET /api/v1/me</span><button type="button" id="copyExample">Copy</button></div>
+          <pre id="quickstartExample"><code>curl https://floraos.life/api/v1/me \
+  -H "Authorization: Bearer flora_pat_YOUR_TOKEN"</code></pre>
+        </div>
+        <div class="endpoint-grid">
+          <article><b>GET</b><code>/api/v1/devices</code><span>List owned FloraCores</span></article>
+          <article><b>GET</b><code>/api/v1/devices/:id/state</code><span>Current state + latest telemetry</span></article>
+          <article><b>GET</b><code>/api/v1/devices/:id/telemetry</code><span>Paginated telemetry history</span></article>
+          <article><b>PATCH</b><code>/api/v1/devices/:id</code><span>Edit owner metadata</span></article>
+          <article><b>GET</b><code>/api/v1/devices/:id/plant</code><span>Read plant profile</span></article>
+          <article><b>PUT</b><code>/api/v1/devices/:id/plant</code><span>Create or update plant profile</span></article>
+          <article><b>GET</b><code>/api/v1/devices/:id/firmware</code><span>Firmware status and approved update visibility</span></article>
+          <article><b>POST</b><code>/api/v1/devices/:id/commands</code><span>Queue an approved physical command</span></article>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div class="developer-modal" id="createTokenModal" hidden>
+    <section class="developer-modal-card" role="dialog" aria-modal="true" aria-labelledby="createTokenTitle">
+      <button class="modal-close" id="closeCreateToken" type="button" aria-label="Close">×</button>
+      <span class="modal-kicker">NEW CREDENTIAL</span>
+      <h2 id="createTokenTitle">Create API Token</h2>
+      <p>Choose only the permissions this integration actually needs.</p>
+
+      <form id="createTokenForm">
+        <label class="developer-field">
+          <span>Token name</span>
+          <input id="tokenName" name="name" maxlength="64" placeholder="Home Assistant" autocomplete="off" required />
+        </label>
+
+        <fieldset class="scope-fieldset">
+          <legend>Permissions</legend>
+          <label><input type="checkbox" name="scope" value="devices:read" checked /><span><b>Read devices</b><small>See owned FloraCore devices and status.</small></span></label>
+          <label><input type="checkbox" name="scope" value="telemetry:read" checked /><span><b>Read telemetry</b><small>Read latest and historical sensor data.</small></span></label>
+          <label><input type="checkbox" name="scope" value="devices:write" /><span><b>Edit device metadata</b><small>Change owner-controlled fields such as nickname.</small></span></label>
+          <label><input type="checkbox" name="scope" value="devices:control" /><span><b>Control devices</b><small>Queue approved physical commands such as bounded watering and timed grow-light control. OTA is excluded.</small></span></label>
+          <label><input type="checkbox" name="scope" value="firmware:read" /><span><b>Read firmware status</b><small>See installed firmware, approved updates, and OTA history.</small></span></label>
+          <label><input type="checkbox" name="scope" value="plants:read" /><span><b>Read plant profiles</b><small>Read plant names, species, and notes.</small></span></label>
+          <label><input type="checkbox" name="scope" value="plants:write" /><span><b>Edit plant profiles</b><small>Create, update, or remove plant profiles.</small></span></label>
+        </fieldset>
+
+        <label class="developer-field">
+          <span>Expiration</span>
+          <select id="tokenExpiration" name="expiration">
+            <option value="30">30 days</option>
+            <option value="90" selected>90 days</option>
+            <option value="180">180 days</option>
+            <option value="365">1 year</option>
+          </select>
+        </label>
+
+        <p class="modal-feedback" id="createTokenFeedback" aria-live="polite"></p>
+        <button class="modal-primary-button" id="createTokenSubmit" type="submit">Create token</button>
+      </form>
+    </section>
+  </div>
+
+  <div class="developer-modal" id="tokenRevealModal" hidden>
+    <section class="developer-modal-card token-reveal-card" role="dialog" aria-modal="true" aria-labelledby="tokenRevealTitle">
+      <span class="modal-kicker success-kicker">TOKEN CREATED</span>
+      <h2 id="tokenRevealTitle">Copy this token now.</h2>
+      <p>FloraOS will not show the full token again after you close this window.</p>
+      <div class="raw-token-box"><code id="rawTokenValue"></code></div>
+      <p class="copy-status" id="tokenCopyStatus" aria-live="polite"></p>
+      <div class="reveal-actions">
+        <button class="modal-primary-button" id="copyRawToken" type="button">Copy token</button>
+        <button class="modal-secondary-button" id="closeTokenReveal" type="button">I've saved it</button>
+      </div>
+    </section>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/developer.js') }}?v=20260901-api12" defer></script>
+</body>
+</html>
