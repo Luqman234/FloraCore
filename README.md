@@ -2,7 +2,7 @@
 
 **An open-source ESP32-S3 plant-care platform combining embedded hardware, secure IoT communication, automation, telemetry, OTA updates, and FloraOS.**
 
-[**Live FloraOS**](https://floraos.life) · [**Firmware source**](https://github.com/Luqman234/FloraCore/tree/firmware) · [**Website source**](https://github.com/Luqman234/FloraCore/tree/website) · [**About**](https://about.floraos.life)
+[**Live FloraOS**](https://floraos.life) · [**Firmware source**](firmware/) · [**FloraOS web source**](web/) · [**Architecture**](docs/ARCHITECTURE.md) · [**Roadmap**](ROADMAP.md)
 
 ---
 
@@ -17,6 +17,28 @@ The result is a connected plant-care platform built around an **ESP32-S3 N16R8**
 FloraCore can monitor the plant environment, automate physical actions, securely communicate with its backend, report telemetry, receive bounded commands, and update its own firmware through rollback-capable OTA.
 
 The goal is not just automatic watering. The goal is to create a platform that can **observe, decide, act, and improve** around a living plant.
+
+---
+
+## Repository layout
+
+FloraCore is migrating to a monorepo so firmware, FloraOS, hardware, documentation, tests, and tooling can evolve together.
+
+```text
+FloraCore/
+├── firmware/              ESP-IDF firmware for the ESP32-S3
+├── web/                   Flask backend + FloraOS dashboard
+├── hardware/              hardware notes, schematics, BOMs and mechanical work
+├── docs/                  architecture, setup and security documentation
+├── tools/                 project-wide development utilities
+├── .github/               issue/PR templates and CI
+├── CONTRIBUTING.md
+├── ROADMAP.md
+├── SECURITY.md
+└── LICENSE
+```
+
+The historical `firmware` and `website` branches remain available as pre-monorepo references while the migration is validated.
 
 ---
 
@@ -107,7 +129,7 @@ FloraCore does **not** trust a browser simply because it knows a device ID.
 
 Physical-device identity is rooted in an ESP32-S3 **HMAC_UP eFuse key**. The firmware uses the hardware HMAC peripheral to derive direction-specific cryptographic material without exposing the raw root key to the application.
 
-Device communication then uses authenticated encryption through the existing FloraOS device channel:
+Device communication then uses authenticated encryption through the FloraOS device channel:
 
 ```text
 HMAC_UP eFuse identity
@@ -133,117 +155,47 @@ Browser authentication, Personal Access Tokens, and device cryptography remain s
 
 Production secrets, device key material, databases, OAuth credentials, SMTP credentials, Turnstile secrets, MFA keys, Wi-Fi credentials, and eFuse key material are intentionally excluded from the public repository.
 
----
-
-## Secure device ownership
-
-FloraCore uses a one-time claim flow instead of trusting a browser-provided device identifier.
-
-```text
-User account generates
-a short-lived claim token
-        │
-        ▼
-FloraCore receives the token
-during setup
-        │
-        ▼
-The authenticated physical device
-submits the token through the
-encrypted device channel
-        │
-        ▼
-FloraOS verifies the claim
-and binds device ownership
-```
-
-This means knowledge of a device ID alone is not enough to take ownership of a FloraCore.
+See [SECURITY.md](SECURITY.md) before working on security-sensitive components.
 
 ---
 
-## Automation
-
-FloraOS can turn sensor conditions into validated physical actions.
-
-Example:
-
-```text
-Soil moisture < 30%
-        │
-        ▼
-Cooldown satisfied?
-        │
-        ▼
-Water for 5 seconds
-```
-
-Automation actions use the same bounded command validator and encrypted device transport as normal FloraOS commands. They do not bypass the device security model.
-
----
-
-## OTA firmware updates
-
-FloraCore supports HTTPS OTA using a dual-slot layout.
-
-```text
-ota_0  ─────┐
-            ├── candidate firmware
-ota_1  ─────┘
-        │
-        ▼
-PENDING_VERIFY
-        │
-   ┌────┴────┐
-   ▼         ▼
- VALID     failure
-             │
-             ▼
-          rollback
-```
-
-The rollback path has been tested with a deliberately broken candidate firmware. The device booted the candidate as `PENDING_VERIFY`, failed validation, and the ESP-IDF bootloader restored the previous valid image.
-
-Current firmware source snapshot: **FloraCore 1.0.3**  
-Development baseline: **ESP-IDF 6.0.2**
-
----
-
-## Source code
-
-This repository currently separates the two major software components by branch.
+## Building the components
 
 ### Firmware
 
-[**Open the `firmware` branch →**](https://github.com/Luqman234/FloraCore/tree/firmware)
+```bash
+cd firmware
+idf.py build
+```
 
-Contains the ESP-IDF source for the ESP32-S3 device, including:
+The current firmware baseline is ESP-IDF 6.0.2. See [firmware/README.md](firmware/README.md) for component-specific notes.
 
-- secure device transport
-- Wi-Fi/BLE runtime
-- SoftAP setup
-- telemetry and heartbeat
-- command protocol
-- local safety arbitration
-- OTA and rollback
-- sensor integration
+### FloraOS web/backend
 
-### FloraOS website and backend
+```bash
+cd web
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-[**Open the `website` branch →**](https://github.com/Luqman234/FloraCore/tree/website)
+Use [web/.env.example](web/.env.example) as the configuration template. Never commit real secrets or production databases.
 
-Contains the Flask-based FloraOS platform, including:
+---
 
-- dashboard
-- user accounts
-- secure device ownership
-- telemetry storage
-- Automation Studio
-- device command queue
-- OTA services
-- public API
-- plant profiles
-- MFA and account security
-- Cloudflare Turnstile integration
+## Contributing
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md), then look at the repository Issues for `good first issue` and `help wanted` tasks.
+
+The monorepo allows a single pull request to update both sides of a protocol change when needed:
+
+```text
+firmware/  ─┐
+            ├── one reviewed change
+web/       ─┘
+```
+
+For larger work, open or claim an issue before implementation.
 
 ---
 
@@ -267,16 +219,6 @@ FloraCore is built around a few principles:
 4. **Firmware updates must be recoverable.**
 5. **Plant-care data should become useful decisions, not just numbers on a screen.**
 6. **The project should be inspectable, modifiable, and open to further development.**
-
----
-
-## Repository branches
-
-| Branch | Purpose |
-| --- | --- |
-| [`main`](https://github.com/Luqman234/FloraCore/tree/main) | Project overview and public entry point |
-| [`firmware`](https://github.com/Luqman234/FloraCore/tree/firmware) | ESP32-S3 FloraOS firmware |
-| [`website`](https://github.com/Luqman234/FloraCore/tree/website) | FloraOS website and backend |
 
 ---
 
