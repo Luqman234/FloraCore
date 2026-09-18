@@ -63,7 +63,7 @@ jobs:
         run: |
           if grep -RInE \
             '/home/Luqman/website|/home/Luqman/ESP32_Project/FloraCore(_git)?' \
-            web tools .github docs \
+            web tools docs \
             --exclude-dir=__pycache__; then
             echo "Legacy machine-specific FloraCore path detected."
             exit 1
