@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07111F" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
+  <title>Verify sign-in — FloraCore</title>
+
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='icons/favicon.svg') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/favicon-32x32.png') }}?v=20260901">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='icons/favicon.ico') }}?v=20260901">
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/mfa.css') }}?v=20260901-mfa1" />
+</head>
+<body>
+  <main class="mfa-shell">
+    <a class="mfa-brand" href="/">
+      <span class="mfa-brand-mark" aria-hidden="true">◇</span>
+      <span>FloraCore</span>
+    </a>
+
+    <section class="mfa-card">
+      {% if expired %}
+        <span class="mfa-kicker">SIGN-IN VERIFICATION</span>
+        <h1>Verification expired.</h1>
+        <p>This MFA challenge is no longer valid. Start the sign-in process again.</p>
+        <a class="mfa-primary-link" href="/login">Return to sign in</a>
+      {% else %}
+        <span class="mfa-kicker">MULTI-FACTOR AUTHENTICATION</span>
+
+        {% if method == "email" %}
+          <h1>Check your email.</h1>
+          <p>We sent a six-digit FloraCore sign-in code to <strong>{{ masked_email }}</strong>.</p>
+        {% else %}
+          <h1>Open your authenticator.</h1>
+          <p>Enter the current six-digit code for FloraCore from your authenticator app.</p>
+        {% endif %}
+
+        <form id="mfaForm" novalidate>
+          <label for="mfaCode">
+            {% if method == "email" %}
+              EMAIL CODE
+            {% else %}
+              AUTHENTICATOR CODE
+            {% endif %}
+          </label>
+
+          <input
+            id="mfaCode"
+            name="code"
+            type="text"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            maxlength="6"
+            pattern="[0-9]{6}"
+            placeholder="000000"
+            autofocus
+          />
+
+          <button class="mfa-primary-button" id="verifyMfaButton" type="submit">Verify and continue</button>
+        </form>
+
+        {% if method == "email" %}
+          <button class="mfa-link-button" id="resendMfaButton" type="button">Send another code</button>
+        {% else %}
+          <button class="mfa-link-button" id="useRecoveryButton" type="button">Use a recovery code instead</button>
+
+          <div class="recovery-entry" id="recoveryEntry" hidden>
+            <label for="recoveryCode">RECOVERY CODE</label>
+            <input
+              id="recoveryCode"
+              type="text"
+              autocomplete="off"
+              maxlength="16"
+              placeholder="XXXX-XXXX-XXXX"
+            />
+            <button class="mfa-secondary-button" id="verifyRecoveryButton" type="button">Use recovery code</button>
+          </div>
+        {% endif %}
+
+        <div class="mfa-message" id="mfaMessage" role="status" aria-live="polite"></div>
+
+        <div class="mfa-footer">
+          <span>Primary sign-in complete.</span>
+          <a href="/login">Start over</a>
+        </div>
+      {% endif %}
+    </section>
+  </main>
+
+  {% if not expired %}
+    <script>
+      window.FLORACORE_MFA_METHOD = {{ method|tojson }};
+    </script>
+    <script src="{{ url_for('static', filename='js/mfa.js') }}?v=20260901-mfa1" defer></script>
+  {% endif %}
+</body>
+</html>

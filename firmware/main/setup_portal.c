@@ -1,0 +1,1125 @@
+#include "setup_portal.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "nvs.h"
+
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
+
+#include "cJSON.h"
+#include "mbedtls/platform_util.h"
+
+#include "floraos_claim.h"
+#include "wifi_credentials.h"
+#include "wifi_manager.h"
+
+static const char *TAG = "SETUP_PORTAL";
+static const char SETUP_CAPTIVE_URI[] = "http://192.168.4.1/";
+
+#define SETUP_AP_IP "192.168.4.1"
+#define SETUP_HTTP_BODY_MAX 512
+#define SETUP_REASON_MAX 48
+#define SETUP_DNS_STACK 4096
+#define SETUP_WORKER_STACK 6144
+#define SETUP_SUPERVISOR_STACK 4096
+#define SETUP_TASK_PRIORITY 4
+#define SETUP_SUCCESS_GRACE_MS 10000
+#define SETUP_CLAIM_RETRY_MAX_DELAY_SECONDS 30
+#define SETUP_NVS_NAMESPACE "setup_state"
+#define SETUP_NVS_PENDING_KEY "pending"
+
+#ifndef FLORACORE_SETUP_AP_OPEN_DEV
+#define FLORACORE_SETUP_AP_OPEN_DEV 1
+#endif
+
+typedef struct
+{
+    char ssid[WIFI_SSID_MAX_LEN];
+    char password[WIFI_PASSWORD_MAX_LEN];
+    char token[FLORAOS_CLAIM_TOKEN_MAX_LEN + 1];
+} setup_submission_t;
+
+static SemaphoreHandle_t s_lock = NULL;
+static QueueHandle_t s_submission_queue = NULL;
+static TaskHandle_t s_worker_task = NULL;
+static TaskHandle_t s_supervisor_task = NULL;
+static TaskHandle_t s_dns_task = NULL;
+static httpd_handle_t s_http_server = NULL;
+
+static volatile bool s_active = false;
+static volatile bool s_dns_running = false;
+static int s_dns_socket = -1;
+
+static setup_portal_state_t s_state = SETUP_IDLE;
+static char s_reason[SETUP_REASON_MAX] = {0};
+static char s_pending_token[FLORAOS_CLAIM_TOKEN_MAX_LEN + 1] = {0};
+static bool s_claim_in_flight = false;
+static unsigned s_claim_attempts = 0;
+static int64_t s_next_claim_attempt_us = 0;
+static int64_t s_success_at_us = 0;
+
+static const char SETUP_PAGE[] =
+"<!doctype html><html><head>"
+"<meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+"<title>Set up your FloraCore</title>"
+"<style>"
+":root{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif;background:#07131d;color:#e8f1f5}"
+"*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:22px;"
+"background:radial-gradient(circle at top,#17384a 0,#07131d 55%)}"
+".card{width:min(560px,100%);background:#0c1e2b;border:1px solid #244050;border-radius:22px;"
+"padding:28px;box-shadow:0 24px 80px #0008}.brand{font-weight:800;letter-spacing:.08em;color:#9bc8d7}"
+"h1{font-size:2rem;margin:.45rem 0}.muted{color:#9aadb8;line-height:1.55}label{display:block;margin-top:18px;"
+"font-size:.86rem;font-weight:700}select,input{width:100%;margin-top:7px;padding:13px 14px;border-radius:12px;"
+"border:1px solid #2b4858;background:#091923;color:#eef7fb;font:inherit}button{width:100%;margin-top:22px;"
+"padding:14px;border:0;border-radius:12px;background:#93c4d3;color:#07131d;font-weight:800;font-size:1rem}"
+"button:disabled{opacity:.55}.status{margin-top:18px;padding:13px;border-radius:12px;background:#081721;"
+"color:#b8c8d0;min-height:48px}.hidden{display:none}.row{display:flex;gap:8px}.row>*{flex:1}"
+"a{color:#a9d4e1}"
+"</style></head><body><main class=card>"
+"<div class=brand>FLORACORE</div><h1>Set up your FloraCore</h1>"
+"<p class=muted>We'll connect your FloraCore to Wi-Fi and your FloraCore account.</p>"
+"<label>Wi-Fi Network</label><select id=ssid><option>Scanning nearby networks…</option></select>"
+"<div id=manualWrap class=hidden><label>Hidden Wi-Fi name</label><input id=manual maxlength=32 autocomplete=off></div>"
+"<label>Wi-Fi Password</label><input id=password type=password maxlength=64 autocomplete=current-password>"
+"<label>Connection Code</label><input id=token maxlength=128 autocomplete=off placeholder='Paste connection code'>"
+"<button id=connect>Connect FloraCore</button><div class=status id=status>Ready to set up your FloraCore.</div>"
+"<script>"
+"const $=id=>document.getElementById(id),sel=$('ssid'),manual=$('manual'),mw=$('manualWrap'),"
+"pw=$('password'),tok=$('token'),btn=$('connect'),status=$('status');"
+"const msg={connecting:'Joining your Wi-Fi network…',wifi_connected:'Wi-Fi connected. Securing connection…',"
+"claiming:'Linking this FloraCore to your account…',success:'FloraCore connected. You can return to floraos.life.'};"
+"async function networks(){try{let r=await fetch('/api/setup/networks');let j=await r.json();sel.innerHTML='';"
+"(j.networks||[]).forEach(n=>{let o=document.createElement('option');o.value=n.ssid;"
+"o.textContent=n.ssid+'  '+(n.rssi>=-55?'●●●':n.rssi>=-70?'●●○':'●○○');sel.appendChild(o)});"
+"let m=document.createElement('option');m.value='__manual__';m.textContent='Hidden network / enter manually';sel.appendChild(m);"
+"if(!(j.networks||[]).length){sel.value='__manual__';mw.classList.remove('hidden')}}catch(e){sel.innerHTML='<option value=__manual__>Enter network manually</option>';mw.classList.remove('hidden')}}"
+"sel.onchange=()=>mw.classList.toggle('hidden',sel.value!=='__manual__');"
+"async function poll(){try{let r=await fetch('/api/setup/status',{cache:'no-store'}),j=await r.json();"
+"status.textContent=j.message||msg[j.state]||'Working…';if(j.state==='success'){btn.disabled=true;"
+"status.innerHTML='FloraCore connected.<br><br><a href=\"https://floraos.life/connect\">Return to floraos.life</a>';return}"
+"if(j.state==='failed'){btn.disabled=false;return}setTimeout(poll,800)}catch(e){setTimeout(poll,1200)}}"
+"btn.onclick=async()=>{let ssid=sel.value==='__manual__'?manual.value:sel.value;"
+"if(!ssid||!tok.value){status.textContent='Choose Wi-Fi and paste your Connection Code.';return}"
+"btn.disabled=true;status.textContent='Saving settings…';let body=new URLSearchParams({ssid,password:pw.value,token:tok.value});"
+"try{let r=await fetch('/api/setup/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});"
+"let j=await r.json();if(!r.ok){status.textContent=j.message||'Could not start setup.';btn.disabled=false;return}"
+"pw.value='';tok.value='';poll()}catch(e){status.textContent='Could not reach FloraCore. Stay connected to the FloraCore Wi-Fi and try again.';btn.disabled=false}};"
+"networks();"
+"</script></main></body></html>";
+
+static void secure_zero(void *ptr, size_t size)
+{
+    if (ptr != NULL && size > 0) {
+        mbedtls_platform_zeroize(ptr, size);
+    }
+}
+
+static esp_err_t setup_pending_store(bool pending)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(
+        SETUP_NVS_NAMESPACE,
+        NVS_READWRITE,
+        &handle
+    );
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_u8(handle, SETUP_NVS_PENDING_KEY, pending ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+bool setup_portal_should_resume(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(
+        SETUP_NVS_NAMESPACE,
+        NVS_READONLY,
+        &handle
+    );
+    if (err != ESP_OK) return false;
+
+    uint8_t value = 0;
+    err = nvs_get_u8(handle, SETUP_NVS_PENDING_KEY, &value);
+    nvs_close(handle);
+
+    return err == ESP_OK && value != 0;
+}
+
+static void state_set_locked(
+    setup_portal_state_t state,
+    const char *reason
+)
+{
+    s_state = state;
+    s_reason[0] = '\0';
+    if (reason != NULL) {
+        strlcpy(s_reason, reason, sizeof(s_reason));
+    }
+}
+
+static void state_set(setup_portal_state_t state, const char *reason)
+{
+    if (s_lock != NULL &&
+        xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        state_set_locked(state, reason);
+        xSemaphoreGive(s_lock);
+    }
+}
+
+static void wipe_pending_token_locked(void)
+{
+    secure_zero(s_pending_token, sizeof(s_pending_token));
+    s_claim_in_flight = false;
+    s_claim_attempts = 0;
+    s_next_claim_attempt_us = 0;
+}
+
+setup_portal_state_t setup_portal_state(void)
+{
+    setup_portal_state_t value = SETUP_IDLE;
+    if (s_lock != NULL &&
+        xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        value = s_state;
+        xSemaphoreGive(s_lock);
+    }
+    return value;
+}
+
+const char *setup_portal_state_name(setup_portal_state_t state)
+{
+    switch (state) {
+        case SETUP_CONNECTING: return "connecting";
+        case SETUP_WIFI_CONNECTED: return "wifi_connected";
+        case SETUP_CLAIMING: return "claiming";
+        case SETUP_SUCCESS: return "success";
+        case SETUP_FAILED: return "failed";
+        default: return "idle";
+    }
+}
+
+void setup_portal_reason(char *buffer, size_t capacity)
+{
+    if (buffer == NULL || capacity == 0) return;
+    buffer[0] = '\0';
+
+    if (s_lock != NULL &&
+        xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        strlcpy(buffer, s_reason, capacity);
+        xSemaphoreGive(s_lock);
+    }
+}
+
+bool setup_portal_is_active(void)
+{
+    return s_active;
+}
+
+static const char *friendly_message(
+    setup_portal_state_t state,
+    const char *reason
+)
+{
+    if (state == SETUP_CONNECTING)
+        return "Joining your Wi-Fi network…";
+    if (state == SETUP_WIFI_CONNECTED)
+        return "Wi-Fi is connected. Securing FloraCore services…";
+    if (state == SETUP_CLAIMING) {
+        if (reason != NULL && strcmp(reason, "backend_unreachable") == 0)
+            return "FloraCore connected to Wi-Fi, but couldn't reach FloraCore services. We'll retry.";
+        return "Linking this FloraCore to your account…";
+    }
+    if (state == SETUP_SUCCESS)
+        return "FloraCore connected. You can return to floraos.life.";
+    if (state != SETUP_FAILED)
+        return "Ready to set up your FloraCore.";
+
+    if (reason == NULL) reason = "";
+
+    if (strcmp(reason, "wifi_auth_failed") == 0)
+        return "FloraCore couldn't connect to this Wi-Fi network. Check the password and try again.";
+    if (strcmp(reason, "wifi_not_found") == 0)
+        return "That Wi-Fi network couldn't be found. Make sure it is nearby and uses 2.4 GHz.";
+    if (strcmp(reason, "wifi_timeout") == 0)
+        return "The Wi-Fi connection took too long. Check the network and try again.";
+    if (strcmp(reason, "no_internet") == 0)
+        return "FloraCore connected to Wi-Fi, but the internet isn't available.";
+    if (strcmp(reason, "storage_failed") == 0)
+        return "FloraCore connected, but couldn't safely save the Wi-Fi settings. Please try again.";
+    if (strcmp(reason, "claim_expired") == 0 ||
+        strcmp(reason, "invalid_claim_token") == 0)
+        return "This Connection Code is no longer valid. Generate a new one on floraos.life.";
+    if (strcmp(reason, "device_already_owned") == 0)
+        return "This FloraCore is already linked to another account.";
+    if (strcmp(reason, "backend_unreachable") == 0)
+        return "FloraCore is online, but couldn't reach FloraCore services. We'll retry.";
+    return "FloraCore couldn't verify the secure server response. Please try again.";
+}
+
+static esp_err_t send_json(httpd_req_t *req, const char *json)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, json);
+}
+
+static esp_err_t root_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, SETUP_PAGE, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t redirect_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", SETUP_CAPTIVE_URI);
+    return httpd_resp_send(req, NULL, 0);
+}
+
+static esp_err_t networks_handler(httpd_req_t *req)
+{
+    wifi_manager_scan_result_t results[WIFI_MANAGER_SCAN_MAX_RESULTS];
+    size_t count = 0;
+
+    esp_err_t err = wifi_manager_scan_visible(
+        results,
+        WIFI_MANAGER_SCAN_MAX_RESULTS,
+        &count
+    );
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *array = cJSON_AddArrayToObject(root, "networks");
+
+    if (err == ESP_OK) {
+        for (size_t i = 0; i < count; i++) {
+            cJSON *item = cJSON_CreateObject();
+            cJSON_AddStringToObject(item, "ssid", results[i].ssid);
+            cJSON_AddNumberToObject(item, "rssi", results[i].rssi);
+            cJSON_AddBoolToObject(item, "secure", results[i].secure);
+            cJSON_AddItemToArray(array, item);
+        }
+    }
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (json == NULL) {
+        return httpd_resp_send_err(
+            req,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "json allocation failed"
+        );
+    }
+
+    esp_err_t send_err = send_json(req, json);
+    cJSON_free(json);
+    return send_err;
+}
+
+static bool url_decode(
+    const char *src,
+    char *dst,
+    size_t dst_capacity
+)
+{
+    if (src == NULL || dst == NULL || dst_capacity == 0) return false;
+
+    size_t out = 0;
+    for (size_t i = 0; src[i] != '\0'; i++) {
+        if (out + 1 >= dst_capacity) return false;
+
+        if (src[i] == '+') {
+            dst[out++] = ' ';
+        } else if (src[i] == '%' &&
+                   src[i + 1] != '\0' &&
+                   src[i + 2] != '\0') {
+            char hex[3] = {src[i + 1], src[i + 2], '\0'};
+            char *end = NULL;
+            long value = strtol(hex, &end, 16);
+            if (end == NULL || *end != '\0') return false;
+            dst[out++] = (char)value;
+            i += 2;
+        } else {
+            dst[out++] = src[i];
+        }
+    }
+
+    dst[out] = '\0';
+    return true;
+}
+
+static bool form_value(
+    const char *body,
+    const char *name,
+    char *output,
+    size_t output_capacity
+)
+{
+    if (body == NULL || name == NULL || output == NULL) return false;
+
+    size_t name_len = strlen(name);
+    const char *cursor = body;
+
+    while (*cursor != '\0') {
+        const char *pair_end = strchr(cursor, '&');
+        if (pair_end == NULL) pair_end = cursor + strlen(cursor);
+
+        const char *eq = memchr(cursor, '=', (size_t)(pair_end - cursor));
+        if (eq != NULL &&
+            (size_t)(eq - cursor) == name_len &&
+            memcmp(cursor, name, name_len) == 0) {
+            size_t encoded_len = (size_t)(pair_end - eq - 1);
+            char encoded[FLORAOS_CLAIM_TOKEN_MAX_LEN * 3 + 1];
+
+            if (encoded_len >= sizeof(encoded)) return false;
+            memcpy(encoded, eq + 1, encoded_len);
+            encoded[encoded_len] = '\0';
+
+            bool ok = url_decode(encoded, output, output_capacity);
+            secure_zero(encoded, sizeof(encoded));
+            return ok;
+        }
+
+        cursor = *pair_end == '&' ? pair_end + 1 : pair_end;
+    }
+
+    return false;
+}
+
+static esp_err_t connect_handler(httpd_req_t *req)
+{
+    if (req->content_len <= 0 || req->content_len > SETUP_HTTP_BODY_MAX) {
+        return httpd_resp_send_err(
+            req,
+            HTTPD_400_BAD_REQUEST,
+            "invalid request"
+        );
+    }
+
+    char body[SETUP_HTTP_BODY_MAX + 1] = {0};
+    int received = 0;
+
+    while (received < req->content_len) {
+        int rc = httpd_req_recv(
+            req,
+            body + received,
+            req->content_len - received
+        );
+        if (rc <= 0) {
+            secure_zero(body, sizeof(body));
+            return ESP_FAIL;
+        }
+        received += rc;
+    }
+
+    setup_submission_t *submission = calloc(1, sizeof(*submission));
+    if (submission == NULL) {
+        secure_zero(body, sizeof(body));
+        return httpd_resp_send_err(
+            req,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "not enough memory"
+        );
+    }
+
+    bool ok =
+        form_value(body, "ssid", submission->ssid, sizeof(submission->ssid)) &&
+        form_value(body, "password", submission->password, sizeof(submission->password)) &&
+        form_value(body, "token", submission->token, sizeof(submission->token));
+
+    secure_zero(body, sizeof(body));
+
+    size_t ssid_len = strlen(submission->ssid);
+    size_t password_len = strlen(submission->password);
+
+    if (!ok ||
+        ssid_len == 0 ||
+        ssid_len >= WIFI_SSID_MAX_LEN ||
+        password_len >= WIFI_PASSWORD_MAX_LEN ||
+        !floraos_claim_token_is_valid(submission->token)) {
+        secure_zero(submission, sizeof(*submission));
+        free(submission);
+        return send_json(
+            req,
+            "{\"ok\":false,\"message\":\"Check the Wi-Fi details and Connection Code.\"}"
+        );
+    }
+
+    if (xQueueSend(
+            s_submission_queue,
+            &submission,
+            pdMS_TO_TICKS(100)
+        ) != pdTRUE) {
+        secure_zero(submission, sizeof(*submission));
+        free(submission);
+        return send_json(
+            req,
+            "{\"ok\":false,\"message\":\"FloraCore is already processing setup.\"}"
+        );
+    }
+
+    state_set(SETUP_CONNECTING, NULL);
+    return send_json(req, "{\"ok\":true}");
+}
+
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    setup_portal_state_t state = setup_portal_state();
+    char reason[SETUP_REASON_MAX] = {0};
+    setup_portal_reason(reason, sizeof(reason));
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "state", setup_portal_state_name(state));
+    if (reason[0] != '\0') {
+        cJSON_AddStringToObject(root, "reason", reason);
+    }
+    cJSON_AddStringToObject(root, "message", friendly_message(state, reason));
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (json == NULL) {
+        return httpd_resp_send_err(
+            req,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "json allocation failed"
+        );
+    }
+
+    esp_err_t err = send_json(req, json);
+    cJSON_free(json);
+    return err;
+}
+
+static esp_err_t start_http_server(void)
+{
+    if (s_http_server != NULL) return ESP_OK;
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 12;
+    config.lru_purge_enable = true;
+
+    esp_err_t err = httpd_start(&s_http_server, &config);
+    if (err != ESP_OK) return err;
+
+    const httpd_uri_t routes[] = {
+        {.uri = "/", .method = HTTP_GET, .handler = root_handler},
+        {.uri = "/api/setup/networks", .method = HTTP_GET, .handler = networks_handler},
+        {.uri = "/api/setup/connect", .method = HTTP_POST, .handler = connect_handler},
+        {.uri = "/api/setup/status", .method = HTTP_GET, .handler = status_handler},
+
+        {.uri = "/generate_204", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/gen_204", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/ncsi.txt", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/nm-check.txt", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/canonical.html", .method = HTTP_GET, .handler = redirect_handler},
+        {.uri = "/success.txt", .method = HTTP_GET, .handler = redirect_handler}
+    };
+
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            httpd_register_uri_handler(s_http_server, &routes[i])
+        );
+    }
+
+    return ESP_OK;
+}
+
+static void stop_http_server(void)
+{
+    if (s_http_server != NULL) {
+        httpd_handle_t server = s_http_server;
+        s_http_server = NULL;
+        (void)httpd_stop(server);
+    }
+}
+
+static void dns_server_task(void *parameter)
+{
+    (void)parameter;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        s_dns_running = false;
+        s_dns_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    s_dns_socket = sock;
+
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(53),
+        .sin_addr.s_addr = htonl(INADDR_ANY)
+    };
+
+    if (bind(
+            sock,
+            (struct sockaddr *)&address,
+            sizeof(address)
+        ) < 0) {
+        close(sock);
+        s_dns_socket = -1;
+        s_dns_running = false;
+        s_dns_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    s_dns_running = true;
+    uint8_t request[512];
+    uint8_t response[512];
+
+    while (s_dns_running) {
+        struct sockaddr_in client;
+        socklen_t client_len = sizeof(client);
+
+        int len = recvfrom(
+            sock,
+            request,
+            sizeof(request),
+            0,
+            (struct sockaddr *)&client,
+            &client_len
+        );
+        if (len < 12) continue;
+
+        memcpy(response, request, (size_t)len);
+
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6] = 0x00;
+        response[7] = 0x01;
+        response[8] = response[9] = response[10] = response[11] = 0;
+
+        /*
+         * Parse exactly one ordinary DNS question defensively.
+         *
+         * A DNS label is at most 63 bytes. Compression pointers are legal in
+         * some DNS fields, but are unnecessary for captive-portal queries and
+         * make this tiny responder substantially harder to reason about, so
+         * reject them here instead of trying to follow attacker-controlled
+         * offsets.
+         *
+         * Keep every bounds check relative to the bytes that will actually be
+         * consumed. The previous check reserved only the 16-byte answer, then
+         * advanced over the 4-byte QTYPE/QCLASS first, allowing a four-byte
+         * write past response[512] for a crafted question.
+         */
+        if (request[4] != 0x00 || request[5] != 0x01) {
+            continue;
+        }
+
+        size_t pos = 12;
+        const size_t packet_len = (size_t)len;
+        bool question_name_ok = false;
+
+        while (pos < packet_len) {
+            const uint8_t label_len = request[pos];
+
+            if (label_len == 0) {
+                pos++;
+                question_name_ok = true;
+                break;
+            }
+
+            if (
+                label_len > 63 ||
+                (label_len & 0xC0U) != 0 ||
+                (size_t)label_len > packet_len - pos - 1
+            ) {
+                question_name_ok = false;
+                break;
+            }
+
+            pos += (size_t)label_len + 1;
+        }
+
+        if (!question_name_ok) {
+            continue;
+        }
+
+        /* QTYPE + QCLASS must be fully present in the received packet. */
+        if (packet_len - pos < 4) {
+            continue;
+        }
+        pos += 4;
+
+        /*
+         * The answer below is exactly 16 bytes. Check after consuming the
+         * question fields so response writes can never cross the 512-byte
+         * stack buffer.
+         */
+        if (pos > sizeof(response) - 16) {
+            continue;
+        }
+
+        response[pos++] = 0xC0;
+        response[pos++] = 0x0C;
+        response[pos++] = 0x00;
+        response[pos++] = 0x01;
+        response[pos++] = 0x00;
+        response[pos++] = 0x01;
+        response[pos++] = 0x00;
+        response[pos++] = 0x00;
+        response[pos++] = 0x00;
+        response[pos++] = 0x1E;
+        response[pos++] = 0x00;
+        response[pos++] = 0x04;
+        response[pos++] = 192;
+        response[pos++] = 168;
+        response[pos++] = 4;
+        response[pos++] = 1;
+
+        sendto(
+            sock,
+            response,
+            (size_t)pos,
+            0,
+            (struct sockaddr *)&client,
+            client_len
+        );
+    }
+
+    close(sock);
+    s_dns_socket = -1;
+    s_dns_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static esp_err_t start_dns_server(void)
+{
+    if (s_dns_task != NULL) return ESP_OK;
+
+    if (xTaskCreate(
+            dns_server_task,
+            "flora_dns",
+            SETUP_DNS_STACK,
+            NULL,
+            SETUP_TASK_PRIORITY,
+            &s_dns_task
+        ) != pdPASS) {
+        s_dns_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+static void stop_dns_server(void)
+{
+    s_dns_running = false;
+
+    if (s_dns_socket >= 0) {
+        shutdown(s_dns_socket, SHUT_RDWR);
+    }
+
+    for (int i = 0; i < 20 && s_dns_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
+static void configure_dhcp_captive_url(void)
+{
+#ifdef CONFIG_ESP_ENABLE_DHCP_CAPTIVEPORTAL
+    esp_netif_t *ap =
+        esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+
+    if (ap == NULL) return;
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_stop(ap));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        esp_netif_dhcps_option(
+            ap,
+            ESP_NETIF_OP_SET,
+            ESP_NETIF_CAPTIVEPORTAL_URI,
+            (void *)SETUP_CAPTIVE_URI,
+            strlen(SETUP_CAPTIVE_URI)
+        )
+    );
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_start(ap));
+#else
+    ESP_LOGI(
+        TAG,
+        "DHCP captive portal option 114 not enabled; DNS redirect fallback is active"
+    );
+#endif
+}
+
+static const char *claim_error_reason(const char *error)
+{
+    if (error == NULL) return "server_verification_failed";
+    if (strcmp(error, "claim_expired") == 0) return "claim_expired";
+    if (strcmp(error, "invalid_claim_token") == 0) return "invalid_claim_token";
+    if (strcmp(error, "claim_cancelled") == 0) return "invalid_claim_token";
+    if (strcmp(error, "claim_already_used") == 0) return "invalid_claim_token";
+    if (strcmp(error, "device_already_owned") == 0) return "device_already_owned";
+    return "server_verification_failed";
+}
+
+static int64_t claim_retry_delay_us(unsigned attempts)
+{
+    unsigned shift = attempts > 5 ? 5 : attempts;
+    unsigned seconds = 1U << shift;
+
+    if (seconds > SETUP_CLAIM_RETRY_MAX_DELAY_SECONDS) {
+        seconds = SETUP_CLAIM_RETRY_MAX_DELAY_SECONDS;
+    }
+
+    return (int64_t)seconds * 1000000LL;
+}
+
+static void claim_result_callback(
+    esp_err_t result,
+    const char *response_plaintext,
+    void *user_ctx
+)
+{
+    (void)user_ctx;
+
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+
+    s_claim_in_flight = false;
+
+    if (result != ESP_OK) {
+        /*
+         * A transport/TLS/Cloudflare failure does not invalidate the user's
+         * Connection Code. Keep the token only in RAM, remain in CLAIMING,
+         * and retry with capped exponential backoff. A definitive encrypted
+         * FloraOS response is what decides success or rejection.
+         */
+        state_set_locked(SETUP_CLAIMING, "backend_unreachable");
+        s_next_claim_attempt_us =
+            esp_timer_get_time() + claim_retry_delay_us(s_claim_attempts);
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    cJSON *root =
+        cJSON_Parse(response_plaintext != NULL ? response_plaintext : "");
+
+    if (root == NULL) {
+        state_set_locked(SETUP_FAILED, "server_verification_failed");
+        wipe_pending_token_locked();
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
+
+    if (cJSON_IsTrue(ok)) {
+        (void)setup_pending_store(false);
+        wipe_pending_token_locked();
+        state_set_locked(SETUP_SUCCESS, NULL);
+        s_success_at_us = esp_timer_get_time();
+        cJSON_Delete(root);
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    cJSON *error = cJSON_GetObjectItemCaseSensitive(root, "error");
+    const char *reason = cJSON_IsString(error)
+        ? claim_error_reason(error->valuestring)
+        : "server_verification_failed";
+
+    state_set_locked(SETUP_FAILED, reason);
+    wipe_pending_token_locked();
+    cJSON_Delete(root);
+    xSemaphoreGive(s_lock);
+}
+
+static void setup_worker_task(void *parameter)
+{
+    (void)parameter;
+
+    while (1) {
+        setup_submission_t *submission = NULL;
+
+        if (xQueueReceive(
+                s_submission_queue,
+                &submission,
+                portMAX_DELAY
+            ) != pdTRUE ||
+            submission == NULL) {
+            continue;
+        }
+
+        state_set(SETUP_CONNECTING, NULL);
+
+        wifi_manager_connect_result_t result =
+            wifi_manager_connect_credentials(
+                submission->ssid,
+                submission->password
+            );
+
+        if (result != WIFI_MANAGER_CONNECT_OK) {
+            state_set(
+                SETUP_FAILED,
+                wifi_manager_connect_result_name(result)
+            );
+            secure_zero(submission, sizeof(*submission));
+            free(submission);
+            continue;
+        }
+
+        state_set(SETUP_WIFI_CONNECTED, NULL);
+
+        esp_err_t save_err = wifi_credentials_save(
+            submission->ssid,
+            submission->password
+        );
+
+        if (save_err != ESP_OK) {
+            state_set(SETUP_FAILED, "storage_failed");
+            secure_zero(submission, sizeof(*submission));
+            free(submission);
+            continue;
+        }
+
+        if (setup_pending_store(true) != ESP_OK) {
+            state_set(SETUP_FAILED, "storage_failed");
+            secure_zero(submission, sizeof(*submission));
+            free(submission);
+            continue;
+        }
+
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            wipe_pending_token_locked();
+            strlcpy(
+                s_pending_token,
+                submission->token,
+                sizeof(s_pending_token)
+            );
+            s_claim_attempts = 0;
+            s_next_claim_attempt_us = esp_timer_get_time();
+            state_set_locked(SETUP_CLAIMING, NULL);
+            xSemaphoreGive(s_lock);
+        }
+
+        secure_zero(submission, sizeof(*submission));
+        free(submission);
+    }
+}
+
+static void stop_setup_services_after_success(void)
+{
+    stop_http_server();
+    stop_dns_server();
+    (void)wifi_manager_stop_setup_ap();
+    s_active = false;
+}
+
+static void setup_supervisor_task(void *parameter)
+{
+    (void)parameter;
+
+    while (1) {
+        bool queue_claim = false;
+        bool stop_after_success = false;
+        char token[FLORAOS_CLAIM_TOKEN_MAX_LEN + 1] = {0};
+
+        if (s_lock != NULL &&
+            xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+            int64_t now = esp_timer_get_time();
+
+            if (s_state == SETUP_CLAIMING &&
+                !s_claim_in_flight &&
+                s_pending_token[0] != '\0' &&
+                now >= s_next_claim_attempt_us) {
+                strlcpy(token, s_pending_token, sizeof(token));
+                s_claim_in_flight = true;
+                if (s_claim_attempts < 6) {
+                    s_claim_attempts++;
+                }
+                state_set_locked(SETUP_CLAIMING, NULL);
+                queue_claim = true;
+            }
+
+            if (s_state == SETUP_SUCCESS &&
+                s_success_at_us > 0 &&
+                now - s_success_at_us >=
+                    (int64_t)SETUP_SUCCESS_GRACE_MS * 1000LL) {
+                stop_after_success = true;
+            }
+
+            xSemaphoreGive(s_lock);
+        }
+
+        if (queue_claim) {
+            esp_err_t err = floraos_claim_start(
+                token,
+                claim_result_callback,
+                NULL
+            );
+
+            secure_zero(token, sizeof(token));
+
+            if (err != ESP_OK &&
+                xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+                s_claim_in_flight = false;
+                state_set_locked(SETUP_CLAIMING, "backend_unreachable");
+                s_next_claim_attempt_us =
+                    esp_timer_get_time() + claim_retry_delay_us(s_claim_attempts);
+                xSemaphoreGive(s_lock);
+            }
+        }
+
+        if (stop_after_success) {
+            stop_setup_services_after_success();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
+static esp_err_t ensure_runtime(void)
+{
+    if (s_lock == NULL) {
+        s_lock = xSemaphoreCreateMutex();
+        if (s_lock == NULL) return ESP_ERR_NO_MEM;
+    }
+
+    if (s_submission_queue == NULL) {
+        s_submission_queue =
+            xQueueCreate(2, sizeof(setup_submission_t *));
+        if (s_submission_queue == NULL) return ESP_ERR_NO_MEM;
+    }
+
+    if (s_worker_task == NULL) {
+        if (xTaskCreate(
+                setup_worker_task,
+                "flora_setup",
+                SETUP_WORKER_STACK,
+                NULL,
+                SETUP_TASK_PRIORITY,
+                &s_worker_task
+            ) != pdPASS) {
+            s_worker_task = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (s_supervisor_task == NULL) {
+        if (xTaskCreate(
+                setup_supervisor_task,
+                "flora_setup_sup",
+                SETUP_SUPERVISOR_STACK,
+                NULL,
+                SETUP_TASK_PRIORITY,
+                &s_supervisor_task
+            ) != pdPASS) {
+            s_supervisor_task = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t setup_portal_start(void)
+{
+    if (s_active) return ESP_OK;
+
+    esp_err_t err = ensure_runtime();
+    if (err != ESP_OK) return err;
+
+    uint8_t mac[6] = {0};
+    err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    if (err != ESP_OK) return err;
+
+    char ssid[WIFI_SSID_MAX_LEN] = {0};
+    snprintf(
+        ssid,
+        sizeof(ssid),
+        "FloraCore-%02X%02X%02X",
+        mac[3],
+        mac[4],
+        mac[5]
+    );
+
+#if FLORACORE_SETUP_AP_OPEN_DEV
+    const char *password = "";
+    ESP_LOGW(
+        TAG,
+        "DEVELOPMENT ONLY: setup SoftAP is open. Add a per-device printed/QR credential before production."
+    );
+#else
+#error "Production setup requires a per-device setup AP credential provisioned during manufacturing."
+#endif
+
+    err = wifi_manager_start_setup_ap(ssid, password);
+    if (err != ESP_OK) return err;
+
+    configure_dhcp_captive_url();
+
+    err = start_http_server();
+    if (err != ESP_OK) {
+        (void)wifi_manager_stop_setup_ap();
+        return err;
+    }
+
+    err = start_dns_server();
+    if (err != ESP_OK) {
+        stop_http_server();
+        (void)wifi_manager_stop_setup_ap();
+        return err;
+    }
+
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+        wipe_pending_token_locked();
+        state_set_locked(SETUP_IDLE, NULL);
+        s_success_at_us = 0;
+        xSemaphoreGive(s_lock);
+    }
+
+    s_active = true;
+
+    ESP_LOGI(TAG, "FloraCore consumer setup mode active");
+    ESP_LOGI(TAG, "Join Wi-Fi: %s", ssid);
+    ESP_LOGI(TAG, "Open: http://" SETUP_AP_IP "/");
+
+    return ESP_OK;
+}
+
+esp_err_t setup_portal_stop(void)
+{
+    stop_http_server();
+    stop_dns_server();
+
+    esp_err_t err = wifi_manager_stop_setup_ap();
+    s_active = false;
+
+    if (s_lock != NULL &&
+        xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+        wipe_pending_token_locked();
+        state_set_locked(SETUP_IDLE, NULL);
+        s_success_at_us = 0;
+        xSemaphoreGive(s_lock);
+    }
+
+    return err;
+}

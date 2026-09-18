@@ -1,0 +1,7 @@
+Flask>=3.1,<4
+Gunicorn>=23,<24
+Authlib>=1.7,<2
+requests>=2.32,<3
+python-dotenv>=1.0,<2
+cryptography>=45,<47
+Werkzeug>=3.1,<4

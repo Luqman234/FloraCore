@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07111F" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
+  <title>Connect FloraCore</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/connect.css') }}" />
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='icons/favicon.svg') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='icons/favicon-32x32.png') }}?v=20260901">
+  <link rel="icon" type="image/png" sizes="64x64" href="{{ url_for('static', filename='icons/favicon-64x64.png') }}?v=20260901">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='icons/favicon.ico') }}?v=20260901">
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='icons/apple-touch-icon.png') }}?v=20260901">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="FloraCore home">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span>FloraCore</span>
+    </a>
+    <div class="topbar-meta">
+      <span class="live"><i></i>SECURE SETUP</span>
+      <span id="sessionLabel">{{ user_email }}</span>
+      <a class="topbar-return" href="/dashboard">Dashboard</a>
+      <button id="logoutButton" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main class="connect-page">
+    <section class="connect-hero">
+      <div>
+        <span class="eyebrow">FLORACORE / GUIDED SETUP</span>
+        <h1>Connect your FloraCore.</h1>
+        <p class="hero-lead">About two minutes. No terminal, no commands, no device ID to type.</p>
+      </div>
+      <div class="trust-card" aria-label="Connection security summary">
+        <div class="trust-icon" aria-hidden="true">✓</div>
+        <div>
+          <span>SECURE BY DESIGN</span>
+          <strong>Your device proves its own identity.</strong>
+          <small>The connection code only links that authenticated FloraCore to your account.</small>
+        </div>
+      </div>
+    </section>
+
+    <section class="connect-layout">
+      <div class="setup-column">
+        <section class="progress-shell" aria-label="Setup progress">
+          <div class="progress-track"><span id="progressBar"></span></div>
+          <div class="progress-meta"><span id="progressLabel">Step 1 of 4</span><strong id="progressTitle">Power on</strong></div>
+        </section>
+
+        <ol class="setup-steps" aria-label="FloraCore connection steps">
+          <li class="setup-step active-step" data-step="1" id="powerStep">
+            <div class="step-number"><span>1</span></div>
+            <div class="step-body">
+              <span class="step-kicker">POWER</span>
+              <h2>Turn on your FloraCore</h2>
+              <p>A new or factory-reset FloraCore enters setup mode automatically. Give it a few seconds to start its setup Wi-Fi.</p>
+              <button class="primary-action" id="powerReadyButton" type="button">My FloraCore is on <span aria-hidden="true">→</span></button>
+            </div>
+          </li>
+
+          <li class="setup-step" data-step="2" id="codeStep">
+            <div class="step-number"><span>2</span></div>
+            <div class="step-body">
+              <span class="step-kicker">ACCOUNT LINK</span>
+              <h2>Create your secure connection code</h2>
+              <p>This code lasts for 10 minutes and can only be used once. You will paste it into your FloraCore setup page.</p>
+              <button class="primary-action" id="generateClaimButton" type="button">Create Connection Code <span aria-hidden="true">→</span></button>
+              <p class="connect-error" id="claimError" aria-live="polite"></p>
+
+              <section class="claim-card" id="claimConsole" hidden aria-live="polite">
+                <div class="claim-card-head">
+                  <div>
+                    <span>CONNECTION CODE</span>
+                    <small>Keep this private until setup is complete.</small>
+                  </div>
+                  <strong id="claimCountdown">10:00</strong>
+                </div>
+                <div class="code-box">
+                  <code id="claimCode">••••••••••••••••</code>
+                  <button type="button" id="copyClaimButton">Copy code</button>
+                </div>
+                <div class="copy-confirm" id="copyConfirm" hidden>Copied — keep it in your clipboard for the next step.</div>
+                <button class="secondary-action" id="codeReadyButton" type="button">I copied the code <span aria-hidden="true">→</span></button>
+              </section>
+            </div>
+          </li>
+
+          <li class="setup-step" data-step="3" id="wifiStep">
+            <div class="step-number"><span>3</span></div>
+            <div class="step-body">
+              <span class="step-kicker">DEVICE SETUP</span>
+              <h2>Join your FloraCore setup Wi-Fi</h2>
+              <p>Open your normal Wi-Fi settings and choose a network whose name starts with <strong>FloraCore-</strong>. No command line is needed.</p>
+              <div class="mini-guide" aria-label="Setup Wi-Fi instructions">
+                <div><span>1</span><p>Open Wi-Fi settings</p></div>
+                <div><span>2</span><p>Join <strong>FloraCore-…</strong></p></div>
+                <div><span>3</span><p>Wait for the setup page</p></div>
+              </div>
+              <div class="setup-actions">
+                <button class="primary-action" id="joinedWifiButton" type="button">I'm connected to FloraCore Wi-Fi <span aria-hidden="true">→</span></button>
+              </div>
+
+              <section class="local-setup-card" id="localSetupCard" hidden>
+                <div class="local-icon" aria-hidden="true">⌁</div>
+                <div>
+                  <h3>Open the FloraCore Setup page</h3>
+                  <p>Your browser may open it automatically. If it does not, use the button below.</p>
+                </div>
+                <a class="open-setup-button" id="openSetupButton" href="http://192.168.4.1/">Open Device Setup</a>
+                <p class="local-note">On that page, choose your home Wi-Fi, enter its password, paste your connection code, then press <strong>Connect</strong>.</p>
+              </section>
+            </div>
+          </li>
+
+          <li class="setup-step" data-step="4" id="finishStep">
+            <div class="step-number"><span>4</span></div>
+            <div class="step-body">
+              <span class="step-kicker">FINISH</span>
+              <h2>Return here and we'll finish automatically</h2>
+              <p>After FloraCore joins your home Wi-Fi, it immediately sends its encrypted ownership claim. Return to this page and we will confirm ownership automatically.</p>
+              <div class="waiting-panel" id="waitingPanel">
+                <div class="waiting-spinner" aria-hidden="true"></div>
+                <div>
+                  <strong id="waitingTitle">Waiting for FloraCore…</strong>
+                  <span id="waitingText">Complete setup on your device, then reconnect this computer or phone to the internet. Temporary FloraCore service failures are retried automatically.</span>
+                </div>
+              </div>
+              <button class="secondary-action" id="checkNowButton" type="button">Check connection now</button>
+            </div>
+          </li>
+        </ol>
+      </div>
+
+      <aside class="connection-status-card" aria-labelledby="statusTitle">
+        <div class="status-orbit" aria-hidden="true"><span></span><i></i><b></b></div>
+        <span class="status-kicker">CONNECTION STATUS</span>
+        <h2 id="statusTitle">{{ 'Add another FloraCore' if connected else 'Ready when you are' }}</h2>
+        <p id="statusDescription">Follow the four guided steps. FloraCore handles the technical details in the background.</p>
+
+        <div class="status-grid">
+          <div><span>ACCOUNT</span><strong>READY</strong></div>
+          <div><span>DEVICE</span><strong id="deviceStatusValue">WAITING</strong></div>
+          <div><span>OWNERSHIP</span><strong id="claimStatusValue">NOT STARTED</strong></div>
+        </div>
+
+        <div class="connected-result" id="connectedResult" hidden>
+          <span class="connected-check" aria-hidden="true">✓</span>
+          <div>
+            <small>FLORACORE CONNECTED</small>
+            <strong id="connectedDeviceId">—</strong>
+          </div>
+        </div>
+
+        <div class="connected-actions">
+          <a class="continue-button" id="continueButton" href="/dashboard" hidden>Continue to Workspace <span aria-hidden="true">→</span></a>
+          <button class="secondary-action" id="connectAnotherButton" type="button" hidden>Connect another FloraCore <span aria-hidden="true">→</span></button>
+        </div>
+      </aside>
+    </section>
+
+    <details class="troubleshooting">
+      <summary>Setup page didn't appear?</summary>
+      <div>
+        <p>Make sure you are connected to a Wi-Fi network beginning with <strong>FloraCore-</strong>, then open <strong>http://192.168.4.1</strong> in your browser. If your device is already connected to another Wi-Fi network, put it back into setup mode and try again.</p>
+        <p>If your connection code expires, return to this page and create a new one. Older unused codes are automatically invalidated.</p>
+      </div>
+    </details>
+  </main>
+
+  <script src="{{ url_for('static', filename='js/connect.js') }}?v=20260901-multi-device" defer></script>
+</body>
+</html>

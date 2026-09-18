@@ -1,0 +1,222 @@
+FLORAOS -> FLORACORE FIRMWARE HANDOFF — COMMAND PROTOCOL v1
+
+This extends the existing authenticated device channel only:
+
+HMAC_UP eFuse KEY0
+  -> derived AES-256-GCM
+  -> POST /api/device/v1/message
+
+Do not add a second command endpoint or plaintext command transport.
+
+1. ADVERTISE CAPABILITY
+
+Every normal authenticated heartbeat from firmware that supports public API
+commands must report:
+
+{
+  "type": "heartbeat",
+  "payload": {
+    "command_protocol": 1,
+    ...
+  }
+}
+
+FloraOS is fail-closed. A normal heartbeat that does not report command_protocol
+will clear server-side command capability for that device.
+
+Do not advertise command_protocol=1 until the firmware can safely parse,
+deduplicate, validate, execute, and acknowledge the command contract below.
+
+2. SERVER RESPONSE
+
+A normal decrypted FloraOS response may contain:
+
+{
+  "ok": true,
+  "server_time": 1788250740,
+  "commands": [
+    {
+      "id": "cmd_...",
+      "type": "water",
+      "parameters": {
+        "duration_ms": 1500
+      },
+      "expires_at": 1788250830
+    }
+  ],
+  "ota": {
+    "available": false
+  }
+}
+
+FloraOS sends at most one physical command per response in command protocol v1.
+Delivery is AT-LEAST-ONCE. The same command ID may therefore arrive more than
+once when a response/acknowledgement is lost.
+
+Firmware MUST deduplicate by command ID. Re-receiving a command ID that was
+already applied must never repeat the physical action.
+
+Use server_time from the same authenticated response to reject a command when:
+
+  expires_at <= server_time
+
+Do not execute an expired command.
+
+3. APPROVED COMMANDS
+
+A) water
+
+{
+  "id": "cmd_...",
+  "type": "water",
+  "parameters": {
+    "duration_ms": 1500
+  },
+  "expires_at": ...
+}
+
+Server bounds:
+  minimum 500 ms
+  maximum 30000 ms
+
+Firmware MUST independently enforce the same or stricter local pump/runtime
+safety limits. Server validation is not a replacement for local hardware safety.
+
+B) grow_light
+
+Turn on with a bounded local timer:
+
+{
+  "id": "cmd_...",
+  "type": "grow_light",
+  "parameters": {
+    "state": "on",
+    "duration_seconds": 3600
+  },
+  "expires_at": ...
+}
+
+Server bounds for on duration:
+  minimum 60 seconds
+  maximum 43200 seconds (12 hours)
+
+Turn off:
+
+{
+  "id": "cmd_...",
+  "type": "grow_light",
+  "parameters": {
+    "state": "off"
+  },
+  "expires_at": ...
+}
+
+For state=on, firmware should consider the command applied once the light state
+has changed and its local auto-off timer has been armed. It does not need to
+wait hours before reporting completed.
+
+4. NOT A COMMAND
+
+Never accept these through command protocol v1:
+
+  ota
+  arbitrary URLs
+  set_gpio
+  raw_command
+  shell commands
+  arbitrary JSON forwarded to hardware
+
+OTA remains the separate server-selected ota object in the encrypted response.
+FloraOS never emits OTA and a physical command in the same response.
+
+5. ACKNOWLEDGEMENT / RESULT
+
+Report command progress through the SAME encrypted /api/device/v1/message route.
+
+Accepted and ready to act:
+
+{
+  "type": "command_result",
+  "payload": {
+    "command_id": "cmd_...",
+    "status": "acknowledged"
+  }
+}
+
+Successful completion/application:
+
+{
+  "type": "command_result",
+  "payload": {
+    "command_id": "cmd_...",
+    "status": "completed",
+    "result": {
+      "duration_ms": 1500
+    }
+  }
+}
+
+Failure/rejection:
+
+{
+  "type": "command_result",
+  "payload": {
+    "command_id": "cmd_...",
+    "status": "failed",
+    "error": "local_safety_rejected"
+  }
+}
+
+Supported status values from device:
+  acknowledged
+  completed
+  failed
+
+"accepted" is also understood by the server as an alias for acknowledged, but
+firmware should emit acknowledged for the canonical contract.
+
+6. LOCAL SAFETY IS AUTHORITATIVE
+
+Even if FloraOS sends a syntactically valid command, firmware must independently
+reject anything unsafe for the local hardware state. Examples include:
+
+  pump already running unexpectedly
+  water reservoir empty
+  local maximum cumulative pump runtime exceeded
+  actuator fault
+  command expired
+  unsupported firmware/hardware revision
+
+Report those as status=failed with a short machine-readable error.
+
+7. SETUP AND OTA EXCLUSION
+
+Do not execute public commands during first-time setup states:
+
+  SETUP_IDLE
+  SETUP_CONNECTING
+  SETUP_WIFI_CONNECTED
+  SETUP_CLAIMING
+
+FloraOS also suppresses command delivery during these states.
+
+The server also suppresses command delivery while an OTA is actively downloading
+or waiting after installation. Physical command delivery takes priority over a
+new OTA offer, so a response never deliberately starts both at once.
+
+8. DEDUPLICATION PERSISTENCE
+
+Because command delivery is at-least-once, firmware should retain a small rolling
+set of recently completed command IDs in persistent storage (for example NVS)
+when repeating an action after reboot would be dangerous.
+
+For a duplicate command ID:
+  do not repeat the actuator action
+  it is safe to report the already-known completed/failed result again
+
+Final rule:
+
+Public API -> validated server command queue -> existing AES-GCM response
+-> local firmware validation -> actuator -> encrypted command_result
+
+The public API never directly controls GPIO and never supplies OTA URLs.

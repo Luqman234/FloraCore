@@ -1,0 +1,198 @@
+/* FloraCore dashboard — Firmware / OTA */
+.firmware-panel {
+  grid-column: span 1;
+}
+
+.firmware-status {
+  border: 1px solid rgba(141, 229, 176, .16);
+  border-radius: 999px;
+  padding: 7px 9px;
+  color: #8DE5B0;
+  background: rgba(141, 229, 176, .05);
+  font: 800 .55rem/1 ui-monospace, monospace;
+  letter-spacing: .08em;
+}
+
+.firmware-status.is-update {
+  color: #92C3D3;
+  border-color: rgba(146, 195, 211, .18);
+  background: rgba(146, 195, 211, .05);
+}
+
+.firmware-status.is-error {
+  color: #FF7B7B;
+  border-color: rgba(255, 123, 123, .18);
+  background: rgba(255, 123, 123, .05);
+}
+
+.firmware-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  margin: 18px 0 0;
+  border: 1px solid rgba(255,255,255,.055);
+  border-radius: 12px;
+  overflow: hidden;
+  background: rgba(255,255,255,.04);
+}
+
+.firmware-grid > div {
+  min-height: 78px;
+  padding: 15px;
+  background: #0A1725;
+}
+
+.firmware-grid dt,
+.firmware-release-meta > span,
+.firmware-history > span {
+  color: #708396;
+  font: 700 .54rem/1 ui-monospace, monospace;
+  letter-spacing: .085em;
+}
+
+.firmware-grid dd {
+  margin: 9px 0 0;
+  color: #F4F7FB;
+  font-weight: 700;
+}
+
+.firmware-release-meta {
+  margin-top: 14px;
+  padding: 15px;
+  border: 1px solid rgba(146,195,211,.12);
+  border-radius: 12px;
+  background: rgba(118,163,178,.035);
+}
+
+.firmware-release-meta strong,
+.firmware-release-meta small {
+  display: block;
+}
+
+.firmware-release-meta strong {
+  margin-top: 9px;
+  color: #F4F7FB;
+}
+
+.firmware-release-meta small {
+  margin-top: 5px;
+  color: #8093A5;
+  font-family: ui-monospace, monospace;
+}
+
+.firmware-history {
+  margin-top: 20px;
+}
+
+#firmwareHistory {
+  margin-top: 10px;
+}
+
+.firmware-history-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 5px 12px;
+  padding: 11px 0;
+  border-top: 1px solid rgba(255,255,255,.055);
+}
+
+.firmware-history-row span {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.firmware-history-row b {
+  color: #DDE8F0;
+  font: 800 .58rem/1 ui-monospace, monospace;
+  letter-spacing: .07em;
+}
+
+.firmware-history-row span small,
+.firmware-history-row em,
+.firmware-history-row > small,
+.firmware-empty,
+.firmware-note {
+  color: #7F91A2;
+  font-size: .75rem;
+}
+
+.firmware-history-row em {
+  font-style: normal;
+}
+
+.firmware-history-row > small {
+  grid-column: 1 / -1;
+  color: #FF9B9B;
+}
+
+.firmware-empty {
+  margin: 12px 0 0;
+}
+
+.firmware-note {
+  margin: 18px 0 0;
+  line-height: 1.55;
+}
+
+@media (max-width: 720px) {
+  .firmware-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Sidebar active-section scroll spy */
+.sidebar a[href^="#"] {
+  position: relative;
+  transition:
+    color .16s ease,
+    background-color .16s ease,
+    transform .16s ease;
+}
+
+.sidebar a[href^="#"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 2px;
+  height: 0;
+  border-radius: 999px;
+  background: #92C3D3;
+  opacity: 0;
+  transform: translateY(-50%);
+  transition:
+    height .16s ease,
+    opacity .16s ease;
+}
+
+.sidebar a[href^="#"].active {
+  color: #F4F7FB;
+  background: rgba(118, 163, 178, .09);
+  transform: translateX(2px);
+}
+
+.sidebar a[href^="#"].active::before {
+  height: 18px;
+  opacity: 1;
+}
+
+/* Keep sticky topbar from covering the section selected from the sidebar. */
+#overview,
+#device,
+#firmware,
+#telemetry,
+#activity {
+  scroll-margin-top: 84px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .sidebar a[href^="#"],
+  .sidebar a[href^="#"]::before {
+    transition: none;
+  }
+}
