@@ -7,7 +7,7 @@ def extract(src,name):
  b=src.index('{',m.start());d=1;e=b+1
  while d:d+=(src[e]=='{')-(src[e]=='}');e+=1
  return src[m.start():e]
-s=(ROOT/'main/setup_portal.c').read_text();claim=(ROOT/'main/floraos_claim.c').read_text()
+s=(ROOT / "firmware" / "main" / "setup_portal.c").read_text();claim=(ROOT / "firmware" / "main" / "floraos_claim.c").read_text()
 code=r'''
 #include <stdbool.h>
 #include <stdint.h>

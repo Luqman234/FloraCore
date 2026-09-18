@@ -10,9 +10,9 @@ def function(src, name):
     while depth:
         depth += (src[end] == '{') - (src[end] == '}'); end += 1
     return src[m.start():end]
-s = (ROOT/'main/setup_portal.c').read_text()
-o = (ROOT/'main/ota_manager.c').read_text()
-c = (ROOT/'main/floraos_client.c').read_text()
+s = (ROOT / "firmware" / "main" / "setup_portal.c").read_text()
+o = (ROOT / "firmware" / "main" / "ota_manager.c").read_text()
+c = (ROOT / "firmware" / "main" / "floraos_client.c").read_text()
 # Extract the exact packet processing block. Only outer-loop rejection becomes return.
 dns = s[s.index('        if (len < 12) continue;'):s.index('        sendto(', s.index('static void dns'))]
 dns = dns.replace('continue;', 'return 0;')
