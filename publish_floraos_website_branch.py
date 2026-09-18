@@ -13,7 +13,7 @@ import tempfile
 
 REPO = "https://github.com/Luqman234/FloraCore.git"
 BRANCH = "website"
-SOURCE = Path("/home/Luqman/website")
+SOURCE = Path(__file__).resolve().parent
 
 # Never publish these.
 EXCLUDED_NAMES = {
@@ -324,17 +324,15 @@ def main() -> int:
         return 2
 
     # Confirm current source imports before publishing.
-    if (SOURCE / ".venv" / "bin" / "python").exists():
-        py = SOURCE / ".venv" / "bin" / "python"
-        result = run(
-            [str(py), "-m", "py_compile", str(SOURCE / "app.py")],
-            cwd=SOURCE,
-            check=False,
-        )
-        print(result.stdout, end="")
-        if result.returncode:
-            print("ERROR: app.py does not compile; refusing to publish.", file=sys.stderr)
-            return 3
+    result = run(
+        [sys.executable, "-m", "py_compile", str(SOURCE / "app.py")],
+        cwd=SOURCE,
+        check=False,
+    )
+    print(result.stdout, end="")
+    if result.returncode:
+        print("ERROR: app.py does not compile; refusing to publish.", file=sys.stderr)
+        return 3
 
     with tempfile.TemporaryDirectory(prefix="floracore-website-publish-") as tmp:
         work = Path(tmp) / "FloraCore"

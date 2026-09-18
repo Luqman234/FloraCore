@@ -74,8 +74,8 @@ def main() -> int:
         check("Gunicorn", lambda: package("gunicorn")),
         check("Werkzeug ProxyFix", proxyfix),
         check("Dependency consistency", pip_check),
-        check("SQLite core schema", database),
         check("Full app import + critical routes", app_import),
+        check("SQLite core schema", database),
     ]
     print()
     if all(checks):
