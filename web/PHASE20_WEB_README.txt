@@ -5,7 +5,7 @@ This package implements the web/backend side of roadmap items 1–20 while prese
 the existing encrypted ESP32 device plane.
 
 After installation:
-  cd /home/Luqman/website
+  cd "$(git rev-parse --show-toplevel)/web"
   source .venv/bin/activate
   python scripts/floracore_preflight.py
   python scripts/run_regression.py

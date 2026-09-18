@@ -13,7 +13,7 @@ import tempfile
 
 REPO = "https://github.com/Luqman234/FloraCore.git"
 BRANCH = "website"
-SOURCE = Path("/home/Luqman/website")
+SOURCE = Path(__file__).resolve().parent
 
 # Never publish these.
 EXCLUDED_NAMES = {

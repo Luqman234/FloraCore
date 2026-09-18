@@ -6,7 +6,7 @@ import sys
 
 def main() -> int:
     source = Path(__file__).resolve().with_name("publish_floraos_website_branch_v2.py")
-    target = Path("/home/Luqman/website/publish_floraos_website_branch.py")
+    target = Path(__file__).resolve().parent / "publish_floraos_website_branch.py"
 
     if not source.exists():
         print(f"Missing corrected publisher: {source}", file=sys.stderr)
@@ -22,7 +22,7 @@ def main() -> int:
     print(f"Installed: {target}")
     print()
     print("Run:")
-    print("  cd /home/Luqman/website")
+    print('  cd "$(git rev-parse --show-toplevel)/web"')
     print("  source .venv/bin/activate")
     print("  python publish_floraos_website_branch.py")
     return 0
