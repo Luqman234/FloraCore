@@ -230,3 +230,5 @@ sdkconfig.old
 *.map
 *.o
 *.a
+
+managed_components/
