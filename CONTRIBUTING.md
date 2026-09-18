@@ -2,15 +2,20 @@
 
 Thank you for considering contributing to FloraCore.
 
-FloraCore is an open-source ESP32-S3 plant-care ecosystem that spans embedded firmware, FloraOS, hardware, automation, telemetry, security, and plant-care logic. You do **not** need to understand the whole system before contributing.
+FloraCore is an open-source ESP32-S3 plant-care ecosystem spanning embedded firmware, FloraOS, hardware, automation, telemetry, security, and plant-care logic. You do **not** need to understand the whole system before contributing.
 
-## Where to contribute
+## Repository layout
 
-The repository currently uses separate branches for the two main software components:
+Development now targets the monorepo layout:
 
-- `main` — project overview, contributor docs, roadmap, and public entry point
-- `firmware` — ESP-IDF firmware for FloraCore devices
-- `website` — FloraOS Flask backend and web dashboard
+- `firmware/` — ESP-IDF firmware for FloraCore devices
+- `web/` — FloraOS Flask backend and web dashboard
+- `hardware/` — hardware design, schematics, BOMs, enclosure and integration notes
+- `docs/` — architecture, setup, security and development documentation
+- `tools/` — project-wide development utilities
+- `.github/` — contribution templates and CI
+
+The historical `firmware` and `website` branches are kept as pre-monorepo references during migration. New contribution work should target the monorepo unless an issue explicitly says otherwise.
 
 ## Good ways to start
 
@@ -29,9 +34,9 @@ Please avoid starting with security-sensitive device authentication, eFuse provi
 ## Development workflow
 
 1. Fork the repository.
-2. Create a focused branch from the component branch you want to change.
+2. Create a focused branch from `main` (or `monorepo-migration` while migration is still under review).
 3. Make one logically scoped change.
-4. Test it locally.
+4. Test the affected component locally.
 5. Commit with a clear message.
 6. Open a pull request describing what changed, why, and how it was tested.
 
@@ -43,6 +48,27 @@ feature/telemetry-chart
 docs/firmware-build-guide
 test/ownership-isolation
 ```
+
+## Component commands
+
+Firmware:
+
+```bash
+cd firmware
+idf.py build
+```
+
+Web/backend:
+
+```bash
+cd web
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m pytest tests
+```
+
+Do not use production credentials or production databases for development tests.
 
 ## Pull request expectations
 
@@ -59,6 +85,18 @@ A good pull request should:
 For firmware changes, include the ESP-IDF version used and whether `idf.py build` succeeds.
 
 For backend changes, include the tests you ran and any database migration impact.
+
+## Cross-component changes
+
+One advantage of the monorepo is that protocol changes can update both firmware and backend in the same PR.
+
+When a change touches both components:
+
+- keep the protocol change explicit
+- update firmware and backend together
+- add regression coverage on both sides where practical
+- document compatibility impact
+- avoid silently breaking deployed devices
 
 ## Security-sensitive areas
 
