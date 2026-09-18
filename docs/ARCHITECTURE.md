@@ -2,15 +2,17 @@
 
 This document gives contributors a fast mental model of the ecosystem. It intentionally focuses on trust boundaries and component responsibilities rather than every implementation detail.
 
-## Repository layout today
+## Repository layout
 
-The repository currently separates major software components by branch:
+FloraCore is migrating to a monorepo:
 
-- `main` — project overview, roadmap, contributor and security docs
-- `firmware` — ESP-IDF firmware for ESP32-S3
-- `website` — Flask-based FloraOS backend and dashboard
+- `firmware/` — ESP-IDF firmware for ESP32-S3
+- `web/` — Flask-based FloraOS backend and dashboard
+- `hardware/` — physical design, schematics, BOMs and integration documentation
+- `docs/` — project-wide architecture/setup/security documentation
+- `tools/` — shared development utilities
 
-A future monorepo migration is planned, but contributors should work with the current branch structure unless an issue says otherwise.
+The old `firmware` and `website` branches are retained as pre-monorepo historical references while the migration is validated.
 
 ## High-level system
 
@@ -145,6 +147,26 @@ automation            != safety bypass
 OTA metadata access   != arbitrary firmware control
 telemetry presence    != live heartbeat
 ```
+
+## Cross-component development
+
+Changes to the device protocol can now be reviewed as one unit:
+
+```text
+firmware/
+   │
+   ├── request/response implementation
+   │
+web/
+   │
+   ├── server-side protocol implementation
+   │
+tests/docs
+   │
+   └── compatibility + regression coverage
+```
+
+The monorepo does not merge the trust boundaries. It only keeps the implementation and documentation together.
 
 ## Where to start
 
