@@ -2,8 +2,8 @@
 
 This branch contains the ESP-IDF firmware for the FloraCore ESP32-S3 N16R8 smart plant-care platform.
 
-Current source snapshot: **FloraCore 1.0.3**  
-Target: **ESP32-S3**  
+Current source snapshot: **FloraCore 1.0.3**
+Target: **ESP32-S3**
 Development baseline: **ESP-IDF 6.0.2**
 
 ## What is included

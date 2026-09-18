@@ -22,7 +22,7 @@ The goal is not just automatic watering. The goal is to create a platform that c
 
 ## Repository layout
 
-FloraCore is migrating to a monorepo so firmware, FloraOS, hardware, documentation, tests, and tooling can evolve together.
+FloraCore uses a monorepo so firmware, FloraOS, hardware, documentation, tests, and tooling can evolve together.
 
 ```text
 FloraCore/

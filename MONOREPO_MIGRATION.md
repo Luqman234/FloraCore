@@ -26,16 +26,16 @@ main project docs         -> repository root + docs/
 
 Before merging the migration to `main`:
 
-- [ ] confirm every firmware source file exists under `firmware/`
-- [ ] confirm every public website/backend source file exists under `web/`
-- [ ] confirm no production secret or database was introduced
-- [ ] run `idf.py build` from `firmware/`
-- [ ] create a clean Python environment from `web/requirements.txt`
-- [ ] run the FloraOS regression tests from `web/`
-- [ ] review README, architecture, security, and contribution links
-- [ ] add monorepo-aware CI
-- [ ] verify GitHub Linguist reports sensible languages
-- [ ] keep historical `firmware` and `website` branches until after migration stabilizes
+- [x] confirm every firmware source file exists under `firmware/`
+- [x] confirm every public website/backend source file exists under `web/`
+- [x] confirm no production secret or database was introduced
+- [x] run `idf.py build` from `firmware/`
+- [x] create a clean Python environment from `web/requirements.txt`
+- [x] run the FloraOS regression tests from `web/`
+- [x] review README, architecture, security, and contribution links
+- [x] add monorepo-aware CI
+- [x] verify GitHub Linguist reports sensible languages
+- [x] keep historical `firmware` and `website` branches until after migration stabilizes
 
 ## Historical branches
 

@@ -3,7 +3,7 @@ PHASE 1–20 COMPATIBILITY CONTRACT
 Date: 2026-09-02
 
 PURPOSE
-=======
+-------
 The web/backend side now has support for:
 - telemetry history and trend analysis
 - notification rules
