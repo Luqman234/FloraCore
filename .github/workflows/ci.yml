@@ -4,11 +4,11 @@ on:
   push:
     branches:
       - main
-      - monorepo-migration
+
   pull_request:
     branches:
       - main
-      - monorepo-migration
+
   workflow_dispatch:
 
 permissions:
