@@ -18,6 +18,12 @@ SMTP credentials, Turnstile secrets, or MFA encryption keys.
 
 Create a local `.env` from `.env.example` and provide your own deployment values.
 
+## Self-hosting
+
+See [../docs/SELF_HOSTING.md](../docs/SELF_HOSTING.md) for running FloraOS on your own infrastructure, provisioning the local device-key registry, and manually pointing current FloraCore firmware at the self-hosted instance.
+
+Current firmware still requires a rebuild/reflash to change FloraOS servers. First-class secure server migration is tracked in [issue #12](https://github.com/Luqman234/FloraCore/issues/12).
+
 ## License
 
 Software in this branch is released under the GNU Affero General Public License
