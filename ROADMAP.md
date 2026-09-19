@@ -25,7 +25,7 @@ Priority: **highest**
 - structured logging and service health monitoring
 - contributor documentation and issue templates
 
-## Phase 3 — Setup and diagnostics
+## Phase 3 — Setup, diagnostics, and server migration
 
 - beginner-friendly secure onboarding
 - clear recovery paths for failed Wi-Fi, expired claims, and interrupted setup
@@ -33,6 +33,11 @@ Priority: **highest**
 - device diagnostics
 - command lifecycle visibility
 - better setup and runtime error messages
+- first-class secure migration from the default FloraOS service to a self-hosted FloraOS instance
+- configurable HTTPS FloraOS server profiles stored securely on-device
+- explicit owner/physical authorization before changing the device's trusted server
+- server-specific cryptographic authority so one FloraOS instance does not automatically inherit another instance's device keys
+- safe OTA-origin migration and recovery behavior when a destination server is unavailable
 
 ## Phase 4 — Telemetry and plant intelligence
 
@@ -70,6 +75,7 @@ All physical actions must continue to pass through the same command-validation a
 - versioned releases
 - complete and stabilize the monorepo migration
 - expanded documentation
+- documented and supported FloraOS self-hosting workflow
 - contributor onboarding
 - external testing by users who did not build FloraCore
 - community-designed integrations and plant profiles
@@ -93,6 +99,7 @@ All physical actions must continue to pass through the same command-validation a
 - automation history
 - API tests
 - deployment documentation
+- self-hosting documentation and deployment validation
 
 ### Advanced
 
@@ -101,6 +108,7 @@ All physical actions must continue to pass through the same command-validation a
 - secure provisioning design
 - OTA hardening
 - device/backend protocol validation
+- secure server migration and server-specific key derivation
 - hardware revision design
 
 ## Guiding principle
