@@ -33,7 +33,7 @@ Priority: **highest**
 - device diagnostics
 - command lifecycle visibility
 - better setup and runtime error messages
-- first-class secure migration from the default FloraOS service to a self-hosted FloraOS instance
+- first-class secure migration from the default FloraOS service to a self-hosted FloraOS instance ([issue #12](https://github.com/Luqman234/FloraCore/issues/12))
 - configurable HTTPS FloraOS server profiles stored securely on-device
 - explicit owner/physical authorization before changing the device's trusted server
 - server-specific cryptographic authority so one FloraOS instance does not automatically inherit another instance's device keys
