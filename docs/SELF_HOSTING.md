@@ -207,4 +207,4 @@ A future server-migration feature should let the physical owner authorize a new 
 - safe handling of OTA origin changes
 - recovery/reset behavior if the destination server is unavailable
 
-See the project roadmap and the corresponding GitHub issue for progress.
+See the project roadmap and [issue #12](https://github.com/Luqman234/FloraCore/issues/12) for progress.
