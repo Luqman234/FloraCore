@@ -2,7 +2,7 @@
 
 **An open-source ESP32-S3 plant-care platform combining embedded hardware, secure IoT communication, automation, telemetry, OTA updates, and FloraOS.**
 
-[**Live FloraOS**](https://floraos.life) · [**Firmware source**](firmware/) · [**FloraOS web source**](web/) · [**Architecture**](docs/ARCHITECTURE.md) · [**Roadmap**](ROADMAP.md)
+[**Live FloraOS**](https://floraos.life) · [**Firmware source**](firmware/) · [**FloraOS web source**](web/) · [**Self-hosting**](docs/SELF_HOSTING.md) · [**Architecture**](docs/ARCHITECTURE.md) · [**Roadmap**](ROADMAP.md)
 
 ---
 
@@ -180,6 +180,14 @@ pip install -r requirements.txt
 ```
 
 Use [web/.env.example](web/.env.example) as the configuration template. Never commit real secrets or production databases.
+
+---
+
+## Self-hosting
+
+FloraOS can be hosted on infrastructure you control. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for the current deployment workflow, device-key provisioning requirements, and the manual firmware changes required to point a FloraCore at another FloraOS instance.
+
+First-class secure server migration without rebuilding firmware is planned and tracked in [issue #12](https://github.com/Luqman234/FloraCore/issues/12).
 
 ---
 
