@@ -174,7 +174,8 @@ static void water_pump_init(void)
 
     gpio_config_t config = {
         .pin_bit_mask = (1ULL << WATER_PUMP_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
+        /* gpio_get_level() needs input enabled for valid status feedback. */
+        .mode = GPIO_MODE_INPUT_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
@@ -188,7 +189,8 @@ static void peristaltic_pump_init(void)
 {
     gpio_config_t config = {
         .pin_bit_mask = (1ULL << PERISTALTIC_PUMP_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
+        /* gpio_get_level() needs input enabled for valid status feedback. */
+        .mode = GPIO_MODE_INPUT_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
@@ -229,7 +231,8 @@ static void water_auto_off(void *arg)
             (void)gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
             water_auto_running = false;
             water_auto_last_off_us = esp_timer_get_time();
-            ESP_LOGI(TAG, "Water pump: OFF (automatic dose complete)");
+            ESP_LOGI(TAG, "Water pump: OFF (automatic dose complete); GPIO47=%s",
+                     gpio_get_level(WATER_PUMP_GPIO) == PUMP_OFF ? "LOW" : "HIGH");
         }
         xSemaphoreGive(water_pump_mutex);
     }
@@ -333,7 +336,8 @@ static void grow_light_init(void)
 {
     gpio_config_t config = {
         .pin_bit_mask = (1ULL << GROW_LIGHT_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
+        /* gpio_get_level() needs input enabled for valid status feedback. */
+        .mode = GPIO_MODE_INPUT_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
@@ -778,8 +782,19 @@ static void water_auto_apply_local_policy(int moisture, bool rtc_valid, const rt
     }
     xSemaphoreGive(water_pump_mutex);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Water pump: ON for %lu ms (~%lu mL automatic dose)",
-                 (unsigned long)duration_ms, (unsigned long)WATER_AUTO_DOSE_ML);
+        /*
+         * Read the physical GPIO input level, now enabled by INPUT_OUTPUT.
+         * This verifies the MCU pin level, NOT motor current or water flow.
+         */
+        int pin_level = gpio_get_level(WATER_PUMP_GPIO);
+        ESP_LOGI(TAG,
+                 "Water pump: ON for %lu ms (~%lu mL automatic dose); GPIO47=%s",
+                 (unsigned long)duration_ms, (unsigned long)WATER_AUTO_DOSE_ML,
+                 pin_level == PUMP_ON ? "HIGH" : "LOW");
+        if (pin_level != PUMP_ON) {
+            ESP_LOGE(TAG,
+                     "Water pump GPIO47 readback is LOW after a HIGH request: check pin wiring/load");
+        }
     } else {
         ESP_LOGE(TAG, "Automatic dose skipped: %s", esp_err_to_name(err));
     }
