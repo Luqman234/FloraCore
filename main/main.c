@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -58,6 +59,20 @@
 #define SOIL_DRY_PERCENT 30
 #define SOIL_WET_PERCENT 70
 
+/* Measured time required to pump 250 mL (water 8.23s, peristaltic 19.62s). */
+#define PUMP_CAL_VOLUME_ML 250U
+#define WATER_PUMP_CAL_MS 8230U
+#define FERTILIZER_PUMP_CAL_MS 19620U
+
+/* Provisional plant-care limits; tune after physical pot/soil trials. */
+#define WATER_AUTO_DOSE_ML 25U
+#define WATER_AUTO_DAILY_LIMIT_ML 100U
+#define WATER_AUTO_SOAK_SECONDS 120U
+#define WATER_AUTO_MAX_RUN_MS 30000U
+#define WATER_AUTO_NVS_NAMESPACE "waterauto"
+#define WATER_AUTO_NVS_DATE_KEY "date"
+#define WATER_AUTO_NVS_USED_KEY "used"
+
 /*
  * Local grow-light policy.
  *
@@ -90,14 +105,19 @@
  * command yet. A short weekly local dose is scheduled from the RTC and the
  * date is persisted BEFORE actuation so reboot cannot double-dose that day.
  *
- * IMPORTANT: calibrate FERTILIZER_RUN_MS against the actual pump flow and
- * nutrient concentration before putting fertilizer in the reservoir.
+ * IMPORTANT: FERTILIZER_TARGET_ML defaults to zero until the diluted target
+ * volume has been chosen for the plant.
  */
 #define FERTILIZER_DAY_OF_WEEK 2
 #define FERTILIZER_HOUR 8
 #define FERTILIZER_MINUTE 0
 #define FERTILIZER_WINDOW_MINUTES 5
-#define FERTILIZER_RUN_MS 2000
+/*
+ * Pump flow does not specify a safe nutrient dose. Keep fertilizer dosing
+ * off until its diluted volume has been chosen for the actual plant.
+ */
+#define FERTILIZER_TARGET_ML 0U
+#define FERTILIZER_MAX_RUN_MS 30000U
 #define FERTILIZER_NVS_NAMESPACE "fertauto"
 #define FERTILIZER_NVS_LAST_DATE_KEY "last_date"
 
@@ -111,6 +131,14 @@ static adc_oneshot_unit_handle_t adc_handle;
 static adc_channel_t soil_adc_channel;
 
 static int64_t grow_light_last_change_us = 0;
+static esp_timer_handle_t water_auto_timer = NULL;
+static SemaphoreHandle_t water_pump_mutex = NULL;
+static bool water_auto_running = false;
+static int64_t water_auto_last_off_us = 0;
+static nvs_handle_t water_auto_nvs = 0;
+static bool water_auto_nvs_open = false;
+static uint32_t water_auto_limit_logged_date = 0;
+
 static esp_timer_handle_t fertilizer_timer = NULL;
 static nvs_handle_t fertilizer_nvs = 0;
 static bool fertilizer_nvs_open = false;
@@ -141,6 +169,9 @@ static uint8_t decimal_to_bcd(uint8_t decimal)
 
 static void water_pump_init(void)
 {
+    water_pump_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(water_pump_mutex != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+
     gpio_config_t config = {
         .pin_bit_mask = (1ULL << WATER_PUMP_GPIO),
         .mode = GPIO_MODE_OUTPUT,
@@ -185,41 +216,117 @@ static bool phase20_fertilizer_get(void)
     return gpio_get_level(PERISTALTIC_PUMP_GPIO) == PUMP_ON;
 }
 
-static void water_pump_on(void)
+/*
+ * Mutex-protected ownership of GPIO47 prevents local water pulses and
+ * authenticated cloud water commands from extending one another's runtime.
+ */
+static void water_auto_off(void *arg)
 {
-    /*
-     * Never energize the watering actuator while firmware is being replaced.
-     * The OTA task can reboot at any point after installation succeeds.
-     */
-    if (ota_manager_update_in_progress()) {
-        gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
-        return;
+    (void)arg;
+    if (water_pump_mutex == NULL) return;
+    if (xSemaphoreTake(water_pump_mutex, portMAX_DELAY) == pdTRUE) {
+        if (water_auto_running) {
+            (void)gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+            water_auto_running = false;
+            water_auto_last_off_us = esp_timer_get_time();
+            ESP_LOGI(TAG, "Water pump: OFF (automatic dose complete)");
+        }
+        xSemaphoreGive(water_pump_mutex);
     }
+}
 
-    gpio_set_level(WATER_PUMP_GPIO, PUMP_ON);
+static void water_auto_abort_local(void)
+{
+    if (water_pump_mutex == NULL) return;
+    if (xSemaphoreTake(water_pump_mutex, portMAX_DELAY) == pdTRUE) {
+        if (water_auto_running) {
+            if (water_auto_timer && esp_timer_is_active(water_auto_timer)) {
+                (void)esp_timer_stop(water_auto_timer);
+            }
+            (void)gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+            water_auto_running = false;
+            water_auto_last_off_us = esp_timer_get_time();
+            ESP_LOGW(TAG, "Water pump: OFF (automatic watering safety abort)");
+        }
+        xSemaphoreGive(water_pump_mutex);
+    }
 }
 
 static void water_pump_off(void)
 {
-    gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+    if (water_pump_mutex == NULL) {
+        (void)gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+        return;
+    }
+    if (xSemaphoreTake(water_pump_mutex, portMAX_DELAY) == pdTRUE) {
+        if (water_auto_timer && esp_timer_is_active(water_auto_timer)) {
+            (void)esp_timer_stop(water_auto_timer);
+        }
+        if (water_auto_running) water_auto_last_off_us = esp_timer_get_time();
+        water_auto_running = false;
+        (void)gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+        xSemaphoreGive(water_pump_mutex);
+    }
 }
 
 static esp_err_t phase20_water_set(bool on)
 {
     if (on && ota_manager_update_in_progress()) {
-        (void)gpio_set_level(WATER_PUMP_GPIO, PUMP_OFF);
+        water_pump_off();
         return ESP_ERR_INVALID_STATE;
     }
+    if (water_pump_mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(water_pump_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
 
-    return gpio_set_level(
-        WATER_PUMP_GPIO,
-        on ? PUMP_ON : PUMP_OFF
-    );
+    esp_err_t err;
+    if (on && water_auto_running) {
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        if (!on && water_auto_running) {
+            if (water_auto_timer && esp_timer_is_active(water_auto_timer)) {
+                (void)esp_timer_stop(water_auto_timer);
+            }
+            water_auto_running = false;
+            water_auto_last_off_us = esp_timer_get_time();
+        }
+        err = gpio_set_level(WATER_PUMP_GPIO, on ? PUMP_ON : PUMP_OFF);
+    }
+    xSemaphoreGive(water_pump_mutex);
+    return err;
 }
 
 static bool phase20_water_get(void)
 {
     return gpio_get_level(WATER_PUMP_GPIO) == PUMP_ON;
+}
+
+static esp_err_t water_automation_init(void)
+{
+    esp_timer_create_args_t args = {
+        .callback = water_auto_off,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "water_auto_off",
+        .skip_unhandled_events = true
+    };
+    esp_err_t err = esp_timer_create(&args, &water_auto_timer);
+    if (err != ESP_OK) return err;
+    err = nvs_open(WATER_AUTO_NVS_NAMESPACE, NVS_READWRITE, &water_auto_nvs);
+    if (err != ESP_OK) return err;
+    water_auto_nvs_open = true;
+    return ESP_OK;
+}
+
+/* Rounded integer conversion avoids floating-point timing error. */
+static uint32_t pump_runtime_ms_for_ml(uint32_t ml, uint32_t calibration_ms)
+{
+    if (ml == 0 || calibration_ms == 0) return 0;
+    uint64_t duration = (
+        (uint64_t)ml * calibration_ms + PUMP_CAL_VOLUME_ML / 2U
+    ) / PUMP_CAL_VOLUME_ML;
+    return (duration > 0 && duration <= UINT32_MAX) ? (uint32_t)duration : 0;
 }
 
 static void grow_light_init(void)
@@ -585,6 +692,93 @@ static uint32_t fertilizer_date_key(const rtc_time_t *rtc)
         (uint32_t)rtc->date;
 }
 
+/* Account for a dose in NVS before activation; reboot cannot repeat it. */
+static bool water_auto_reserve_volume(const rtc_time_t *rtc)
+{
+    if (!water_auto_nvs_open || rtc == NULL) return false;
+    uint32_t date_saved = 0, used_ml = 0;
+    esp_err_t err = nvs_get_u32(
+        water_auto_nvs, WATER_AUTO_NVS_DATE_KEY, &date_saved
+    );
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return false;
+    if (err == ESP_OK && date_saved == fertilizer_date_key(rtc)) {
+        err = nvs_get_u32(water_auto_nvs, WATER_AUTO_NVS_USED_KEY, &used_ml);
+        if (err != ESP_OK) return false;
+    }
+    if (used_ml > WATER_AUTO_DAILY_LIMIT_ML ||
+        WATER_AUTO_DOSE_ML > WATER_AUTO_DAILY_LIMIT_ML - used_ml) return false;
+    err = nvs_set_u32(
+        water_auto_nvs, WATER_AUTO_NVS_DATE_KEY, fertilizer_date_key(rtc)
+    );
+    if (err != ESP_OK) return false;
+    err = nvs_set_u32(
+        water_auto_nvs, WATER_AUTO_NVS_USED_KEY, used_ml + WATER_AUTO_DOSE_ML
+    );
+    if (err != ESP_OK) return false;
+    return nvs_commit(water_auto_nvs) == ESP_OK;
+}
+
+static void water_auto_apply_local_policy(int moisture, bool rtc_valid, const rtc_time_t *rtc)
+{
+    if (ota_manager_update_in_progress() || setup_blocks_normal_cloud_traffic()) {
+        water_auto_abort_local();
+        return;
+    }
+    /* No credible RTC or NVS means no enforceable daily limit: fail closed. */
+    if (!rtc_valid || !rtc_calendar_valid(rtc) || rtc->year < 26 ||
+        !water_auto_nvs_open || !water_auto_timer) {
+        water_auto_abort_local();
+        return;
+    }
+    if (moisture >= SOIL_DRY_PERCENT) {
+        water_auto_abort_local();
+        return;
+    }
+    if (floraos_phase20_water_command_active()) return;
+
+    uint32_t duration_ms = pump_runtime_ms_for_ml(
+        WATER_AUTO_DOSE_ML, WATER_PUMP_CAL_MS
+    );
+    if (!duration_ms || duration_ms > WATER_AUTO_MAX_RUN_MS) {
+        ESP_LOGE(TAG, "Invalid automatic watering runtime");
+        return;
+    }
+    if (xSemaphoreTake(water_pump_mutex, portMAX_DELAY) != pdTRUE) return;
+    if (water_auto_running || phase20_water_get() ||
+        floraos_phase20_water_command_active() ||
+        (water_auto_last_off_us &&
+         esp_timer_get_time() - water_auto_last_off_us <
+         (int64_t)WATER_AUTO_SOAK_SECONDS * 1000000LL)) {
+        xSemaphoreGive(water_pump_mutex);
+        return;
+    }
+    if (!water_auto_reserve_volume(rtc)) {
+        uint32_t date = fertilizer_date_key(rtc);
+        if (water_auto_limit_logged_date != date) {
+            water_auto_limit_logged_date = date;
+            ESP_LOGW(TAG, "Auto watering held: daily limit reached or NVS failed");
+        }
+        xSemaphoreGive(water_pump_mutex);
+        return;
+    }
+
+    esp_err_t err = esp_timer_start_once(
+        water_auto_timer, (uint64_t)duration_ms * 1000ULL
+    );
+    if (err == ESP_OK) {
+        err = gpio_set_level(WATER_PUMP_GPIO, PUMP_ON);
+        if (err == ESP_OK) water_auto_running = true;
+        else (void)esp_timer_stop(water_auto_timer);
+    }
+    xSemaphoreGive(water_pump_mutex);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Water pump: ON for %lu ms (~%lu mL automatic dose)",
+                 (unsigned long)duration_ms, (unsigned long)WATER_AUTO_DOSE_ML);
+    } else {
+        ESP_LOGE(TAG, "Automatic dose skipped: %s", esp_err_to_name(err));
+    }
+}
+
 static void fertilizer_auto_off(void *argument)
 {
     (void)argument;
@@ -657,25 +851,15 @@ static void fertilizer_apply_local_schedule(
     const rtc_time_t *rtc
 )
 {
-    if (
-        !rtc_valid ||
-        !rtc_calendar_valid(rtc) ||
-        !fertilizer_nvs_open ||
-        fertilizer_timer == NULL
-    ) {
-        return;
-    }
-
-    if (
-        ota_manager_update_in_progress() ||
-        setup_blocks_normal_cloud_traffic()
-    ) {
-        if (esp_timer_is_active(fertilizer_timer)) {
+    if (ota_manager_update_in_progress() || setup_blocks_normal_cloud_traffic()) {
+        if (fertilizer_timer && esp_timer_is_active(fertilizer_timer)) {
             (void)esp_timer_stop(fertilizer_timer);
         }
         (void)phase20_fertilizer_set(false);
         return;
     }
+    if (!rtc_valid || !rtc_calendar_valid(rtc) || !fertilizer_nvs_open ||
+        fertilizer_timer == NULL || FERTILIZER_TARGET_ML == 0U) return;
 
     if (esp_timer_is_active(fertilizer_timer)) {
         return;
@@ -700,7 +884,13 @@ static void fertilizer_apply_local_schedule(
         return;
     }
 
-    if (fertilizer_already_dosed_today(rtc)) {
+    if (fertilizer_already_dosed_today(rtc)) return;
+
+    uint32_t run_ms = pump_runtime_ms_for_ml(
+        FERTILIZER_TARGET_ML, FERTILIZER_PUMP_CAL_MS
+    );
+    if (run_ms == 0 || run_ms > FERTILIZER_MAX_RUN_MS) {
+        ESP_LOGW(TAG, "Fertilizer volume results in invalid runtime");
         return;
     }
 
@@ -725,7 +915,7 @@ static void fertilizer_apply_local_schedule(
 
     err = esp_timer_start_once(
         fertilizer_timer,
-        (uint64_t)FERTILIZER_RUN_MS * 1000ULL
+        (uint64_t)run_ms * 1000ULL
     );
 
     if (err != ESP_OK) {
@@ -740,8 +930,9 @@ static void fertilizer_apply_local_schedule(
 
     ESP_LOGI(
         TAG,
-        "Peristaltic pump: ON for %d ms (weekly RTC dose)",
-        FERTILIZER_RUN_MS
+        "Peristaltic pump: ON for %lu ms (~%lu mL weekly RTC dose)",
+        (unsigned long)run_ms,
+        (unsigned long)FERTILIZER_TARGET_ML
     );
 }
 
@@ -1069,6 +1260,15 @@ void app_main(void)
         peristaltic_pump_init();
         grow_light_init();
 
+        esp_err_t water_auto_err = water_automation_init();
+        if (water_auto_err != ESP_OK) {
+            ESP_LOGW(TAG, "Automatic watering disabled: %s",
+                     esp_err_to_name(water_auto_err));
+        }
+        if (FERTILIZER_TARGET_ML == 0U) {
+            ESP_LOGW(TAG, "Fertilizer auto-dose disabled until safe target is configured");
+        }
+
         esp_err_t fertilizer_init_err = fertilizer_automation_init();
         if (fertilizer_init_err != ESP_OK) {
             ESP_LOGW(
@@ -1092,6 +1292,7 @@ void app_main(void)
         esp_err_t phase20_err = floraos_phase20_init(&phase20_ops);
         if (phase20_err == ESP_OK) {
             phase20_ready = true;
+            floraos_phase20_set_water_lockout(true);
         } else {
             ESP_LOGE(
                 TAG,
@@ -1329,9 +1530,7 @@ void app_main(void)
 
             if (average_soil >= SOIL_OUT_OF_SOIL) {
                 floraos_phase20_set_water_lockout(true);
-                if (!floraos_phase20_water_command_active()) {
-                    water_pump_off();
-                }
+                water_auto_abort_local();
 
                 ESP_LOGW(
                     TAG,
@@ -1345,17 +1544,8 @@ void app_main(void)
                 soil_percent_for_cloud = soil_percent;
                 soil_percent_valid = true;
 
-                /*
-                 * A validated cloud watering command temporarily owns the
-                 * water actuator. The local soil loop must not race it.
-                 */
-                if (!floraos_phase20_water_command_active()) {
-                    if (soil_percent < SOIL_DRY_PERCENT) {
-                        water_pump_on();
-                    } else {
-                        water_pump_off();
-                    }
-                }
+                /* Finite calibrated pulses rather than continuously running while dry. */
+                water_auto_apply_local_policy(soil_percent, rtc_valid, &rtc);
 
                 pump_for_cloud = phase20_water_get();
 
@@ -1370,9 +1560,7 @@ void app_main(void)
             }
         } else {
             floraos_phase20_set_water_lockout(true);
-            if (!floraos_phase20_water_command_active()) {
-                water_pump_off();
-            }
+            water_auto_abort_local();
 
             ESP_LOGW(
                 TAG,
