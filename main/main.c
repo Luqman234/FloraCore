@@ -628,11 +628,13 @@ static void grow_light_apply_local_policy(
     const rtc_time_t *rtc
 )
 {
-    if (
-        ota_manager_update_in_progress() ||
-        setup_blocks_normal_cloud_traffic()
-    ) {
-        grow_light_set_local(false, "setup/OTA safety");
+    /*
+     * Plant lighting is a local RTC/BH1750 policy. Wi-Fi provisioning and
+     * FloraOS ownership do not determine whether a plant receives light.
+     * Only an actual OTA operation forces the light OFF.
+     */
+    if (ota_manager_update_in_progress()) {
+        grow_light_set_local(false, "OTA safety");
         return;
     }
 
@@ -720,7 +722,11 @@ static bool water_auto_reserve_volume(const rtc_time_t *rtc)
 
 static void water_auto_apply_local_policy(int moisture, bool rtc_valid, const rtc_time_t *rtc)
 {
-    if (ota_manager_update_in_progress() || setup_blocks_normal_cloud_traffic()) {
+    /*
+     * Offline-first: local sensor watering must not depend on Wi-Fi, a cloud
+     * account, or an unfinished setup portal. OTA remains a hard safety stop.
+     */
+    if (ota_manager_update_in_progress()) {
         water_auto_abort_local();
         return;
     }
@@ -851,7 +857,12 @@ static void fertilizer_apply_local_schedule(
     const rtc_time_t *rtc
 )
 {
-    if (ota_manager_update_in_progress() || setup_blocks_normal_cloud_traffic()) {
+    /*
+     * A configured local RTC dosing schedule also continues while offline.
+     * Nutrient dosing is disabled by default (FERTILIZER_TARGET_ML == 0).
+     * Actual OTA updates still force all outputs safe.
+     */
+    if (ota_manager_update_in_progress()) {
         if (fertilizer_timer && esp_timer_is_active(fertilizer_timer)) {
             (void)esp_timer_stop(fertilizer_timer);
         }
@@ -1075,11 +1086,11 @@ static bool floraos_cloud_housekeeping(
      * is confirmed. During SETUP_IDLE / CONNECTING / WIFI_CONNECTED /
      * CLAIMING / FAILED, setup_portal.c may send only the encrypted claim.
      *
-     * This prevents hello/heartbeat/telemetry from competing with the
-     * ownership handshake on a factory-new FloraCore.
+     * IMPORTANT: this is a cloud-traffic gate, NOT a local-plant-care gate.
+     * Do NOT force actuator outputs off just because Wi-Fi/account setup is
+     * unfinished. RTC/sensor policy remains active independently.
      */
     if (setup_blocks_normal_cloud_traffic()) {
-        floraos_phase20_force_safe_outputs();
         if (hello_announced != NULL) {
             *hello_announced = false;
         }
@@ -1345,6 +1356,12 @@ void app_main(void)
                 ? "Previous customer setup has not completed ownership"
                 : "FloraCore needs Wi-Fi configuration"
         );
+        if (boot_mode == FLORACORE_MODE_NORMAL) {
+            ESP_LOGI(
+                TAG,
+                "Offline local plant care enabled; setup blocks cloud traffic only"
+            );
+        }
 
         setup_start_result =
             setup_portal_start();
