@@ -698,30 +698,71 @@ static uint32_t fertilizer_date_key(const rtc_time_t *rtc)
         (uint32_t)rtc->date;
 }
 
-/* Account for a dose in NVS before activation; reboot cannot repeat it. */
-static bool water_auto_reserve_volume(const rtc_time_t *rtc)
+typedef enum {
+    WATER_RESERVE_OK = 0,
+    WATER_RESERVE_DAILY_LIMIT,
+    WATER_RESERVE_NVS_ERROR
+} water_reserve_result_t;
+
+/*
+ * NVS reserves water before GPIO47 switches on, including across reboots.
+ * Distinguish a real daily cap from an NVS fault; neither should be bypassed.
+ */
+static water_reserve_result_t water_auto_reserve_volume(
+    const rtc_time_t *rtc,
+    uint32_t *used_before_ml,
+    esp_err_t *storage_err
+)
 {
-    if (!water_auto_nvs_open || rtc == NULL) return false;
-    uint32_t date_saved = 0, used_ml = 0;
+    *used_before_ml = 0U;
+    *storage_err = ESP_OK;
+
+    if (!water_auto_nvs_open || rtc == NULL) {
+        *storage_err = ESP_ERR_INVALID_STATE;
+        return WATER_RESERVE_NVS_ERROR;
+    }
+
+    uint32_t date_saved = 0U;
+    uint32_t used_ml = 0U;
     esp_err_t err = nvs_get_u32(
         water_auto_nvs, WATER_AUTO_NVS_DATE_KEY, &date_saved
     );
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return false;
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        *storage_err = err;
+        return WATER_RESERVE_NVS_ERROR;
+    }
+
     if (err == ESP_OK && date_saved == fertilizer_date_key(rtc)) {
         err = nvs_get_u32(water_auto_nvs, WATER_AUTO_NVS_USED_KEY, &used_ml);
-        if (err != ESP_OK) return false;
+        if (err != ESP_OK) {
+            *storage_err = err;
+            return WATER_RESERVE_NVS_ERROR;
+        }
     }
+
+    *used_before_ml = used_ml;
     if (used_ml > WATER_AUTO_DAILY_LIMIT_ML ||
-        WATER_AUTO_DOSE_ML > WATER_AUTO_DAILY_LIMIT_ML - used_ml) return false;
+        WATER_AUTO_DOSE_ML > WATER_AUTO_DAILY_LIMIT_ML - used_ml) {
+        return WATER_RESERVE_DAILY_LIMIT;
+    }
+
+    /* These two NVS fields are persisted before pump activation. */
     err = nvs_set_u32(
         water_auto_nvs, WATER_AUTO_NVS_DATE_KEY, fertilizer_date_key(rtc)
     );
-    if (err != ESP_OK) return false;
-    err = nvs_set_u32(
-        water_auto_nvs, WATER_AUTO_NVS_USED_KEY, used_ml + WATER_AUTO_DOSE_ML
-    );
-    if (err != ESP_OK) return false;
-    return nvs_commit(water_auto_nvs) == ESP_OK;
+    if (err == ESP_OK) {
+        err = nvs_set_u32(
+            water_auto_nvs, WATER_AUTO_NVS_USED_KEY,
+            used_ml + WATER_AUTO_DOSE_ML
+        );
+    }
+    if (err == ESP_OK) err = nvs_commit(water_auto_nvs);
+    if (err != ESP_OK) {
+        *storage_err = err;
+        return WATER_RESERVE_NVS_ERROR;
+    }
+
+    return WATER_RESERVE_OK;
 }
 
 static void water_auto_apply_local_policy(int moisture, bool rtc_valid, const rtc_time_t *rtc)
@@ -762,15 +803,42 @@ static void water_auto_apply_local_policy(int moisture, bool rtc_valid, const rt
         xSemaphoreGive(water_pump_mutex);
         return;
     }
-    if (!water_auto_reserve_volume(rtc)) {
+    uint32_t used_before_ml = 0U;
+    esp_err_t storage_err = ESP_OK;
+    water_reserve_result_t reserve = water_auto_reserve_volume(
+        rtc, &used_before_ml, &storage_err
+    );
+    if (reserve != WATER_RESERVE_OK) {
         uint32_t date = fertilizer_date_key(rtc);
         if (water_auto_limit_logged_date != date) {
             water_auto_limit_logged_date = date;
-            ESP_LOGW(TAG, "Auto watering held: daily limit reached or NVS failed");
+            if (reserve == WATER_RESERVE_DAILY_LIMIT) {
+                ESP_LOGW(
+                    TAG,
+                    "Auto watering: daily limit reached (%lu/%lu mL used; next %lu mL pulse held)",
+                    (unsigned long)used_before_ml,
+                    (unsigned long)WATER_AUTO_DAILY_LIMIT_ML,
+                    (unsigned long)WATER_AUTO_DOSE_ML
+                );
+            } else {
+                ESP_LOGE(
+                    TAG,
+                    "Auto watering: NVS water-budget error: %s (0x%x); fail closed",
+                    esp_err_to_name(storage_err),
+                    (unsigned int)storage_err
+                );
+            }
         }
         xSemaphoreGive(water_pump_mutex);
         return;
     }
+    ESP_LOGI(
+        TAG,
+        "Auto watering: reserved %lu mL; daily budget %lu/%lu mL used",
+        (unsigned long)WATER_AUTO_DOSE_ML,
+        (unsigned long)(used_before_ml + WATER_AUTO_DOSE_ML),
+        (unsigned long)WATER_AUTO_DAILY_LIMIT_ML
+    );
 
     esp_err_t err = esp_timer_start_once(
         water_auto_timer, (uint64_t)duration_ms * 1000ULL
